@@ -1,0 +1,44 @@
+# Compiled Object files, Static and Dynamic libs (Shared Objects)
+*.o
+*.a
+*.so
+
+# Folders
+_obj
+_test
+
+# Architecture specific extensions/prefixes
+*.[568vq]
+[568vq].out
+
+*.cgo1.go
+*.cgo2.c
+_cgo_defun.c
+_cgo_gotypes.go
+_cgo_export.*
+
+_testmain.go
+
+*.exe
+*.test
+
+# Harness: 本地工具与 Agent 运行产物
+.openspec-auto-backup/
+.openspec-auto/
+.idea/
+.vscode/
+.Ds_Store
+.DS_Store
+*.log
+findings.md
+progress.md
+task_plan.md
+.harness/
+.claude/
+.codex/
+.agents/
+openspec/
+AGENTS.md
+CLAUDE.md
+tools/
+.harness/VERSION
