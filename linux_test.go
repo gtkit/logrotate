@@ -4,6 +4,7 @@
 package logrotate
 
 import (
+	"errors"
 	"os"
 	"syscall"
 	"testing"
@@ -172,9 +173,87 @@ func TestCompressMaintainOwner(t *testing.T) {
 	equals(666, fakeFS.files[filename2+compressSuffix].gid, t)
 }
 
+func TestChownReturnsCloseError(t *testing.T) {
+	tests := []struct {
+		name       string
+		closeErr   error
+		wantErr    error
+		wantChown  bool
+		wantOpened bool
+	}{
+		{
+			name:       "close error",
+			closeErr:   errors.New("close failed"),
+			wantErr:    errors.New("close failed"),
+			wantOpened: true,
+		},
+	}
+
+	oldOpenFile := osOpenFile
+	oldChown := osChown
+	defer func() {
+		osOpenFile = oldOpenFile
+		osChown = oldChown
+	}()
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opened := false
+			chowned := false
+			osOpenFile = func(string, int, os.FileMode) (chownFile, error) {
+				opened = true
+				return closeErrorFile{err: tt.closeErr}, nil
+			}
+			osChown = func(string, int, int) error {
+				chowned = true
+				return nil
+			}
+
+			err := chown("ignored.log", fakeStatFileInfo{})
+			equals(tt.wantErr.Error(), err.Error(), t)
+			equals(tt.wantOpened, opened, t)
+			equals(tt.wantChown, chowned, t)
+		})
+	}
+}
+
 type fakeFile struct {
 	uid int
 	gid int
+}
+
+type closeErrorFile struct {
+	err error
+}
+
+func (f closeErrorFile) Close() error {
+	return f.err
+}
+
+type fakeStatFileInfo struct{}
+
+func (fakeStatFileInfo) Name() string {
+	return "ignored.log"
+}
+
+func (fakeStatFileInfo) Size() int64 {
+	return 0
+}
+
+func (fakeStatFileInfo) Mode() os.FileMode {
+	return 0o644
+}
+
+func (fakeStatFileInfo) ModTime() time.Time {
+	return time.Time{}
+}
+
+func (fakeStatFileInfo) IsDir() bool {
+	return false
+}
+
+func (fakeStatFileInfo) Sys() any {
+	return &syscall.Stat_t{}
 }
 
 type fakeFS struct {

@@ -83,6 +83,10 @@ var _ io.WriteCloser = (*Logger)(nil)
 // time, which may differ from the last time that file was written to.
 //
 // If MaxBackups and MaxAge are both 0, no old log files will be deleted.
+//
+// Logger serializes concurrent writes to preserve size accounting, rotation
+// decisions, and write order. Set exported configuration fields before first use
+// and do not modify them concurrently with Write, Rotate, or Close.
 type Logger struct {
 	// Filename is the file to write logs to.  Backup log files will be retained
 	// in the same directory.  It uses <processname>-logrotate.log in
@@ -133,9 +137,6 @@ type Logger struct {
 
 	filenameMu      sync.RWMutex
 	currentFilename string
-
-	millCh    chan bool
-	startMill sync.Once
 }
 
 var (
@@ -144,6 +145,11 @@ var (
 
 	// os_Stat exists so it can be mocked out by tests.
 	osStat = os.Stat
+
+	millMu      sync.Mutex
+	millCh      chan struct{}
+	millPending map[*Logger]struct{}
+	startMill   sync.Once
 
 	// megabyte is the conversion factor between MaxSize and bytes.  It is a
 	// variable so tests can mock it out and not need to write megabytes of data
@@ -420,22 +426,39 @@ func (l *Logger) millRunOnce() error {
 
 // millRun runs in a goroutine to manage post-rotation compression and removal
 // of old log files.
-func (l *Logger) millRun() {
-	for range l.millCh {
-		// what am I going to do, log this?
-		_ = l.millRunOnce()
+func millRun() {
+	for range millCh {
+		for {
+			millMu.Lock()
+			var l *Logger
+			for pending := range millPending {
+				l = pending
+				delete(millPending, pending)
+				break
+			}
+			millMu.Unlock()
+			if l == nil {
+				break
+			}
+			// what am I going to do, log this?
+			_ = l.millRunOnce()
+		}
 	}
 }
 
 // mill performs post-rotation compression and removal of stale log files,
 // starting the mill goroutine if necessary.
 func (l *Logger) mill() {
-	l.startMill.Do(func() {
-		l.millCh = make(chan bool, 1)
-		go l.millRun()
+	startMill.Do(func() {
+		millCh = make(chan struct{}, 1)
+		millPending = make(map[*Logger]struct{})
+		go millRun()
 	})
+	millMu.Lock()
+	millPending[l] = struct{}{}
+	millMu.Unlock()
 	select {
-	case l.millCh <- true:
+	case millCh <- struct{}{}:
 	default:
 	}
 }

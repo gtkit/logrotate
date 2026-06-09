@@ -131,6 +131,10 @@ time, which may differ from the last time that file was written to.
 
 If MaxBackups and MaxAge are both 0, no old log files will be deleted.
 
+Logger serializes concurrent writes to preserve size accounting, rotation
+decisions, and write order. Set exported configuration fields before first use
+and do not modify them concurrently with Write, Rotate, or Close.
+
 
 
 

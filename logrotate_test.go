@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -127,6 +128,30 @@ func TestDefaultFilename(t *testing.T) {
 	isNil(err, t)
 	equals(len(b), n, t)
 	existsWithContent(filename, b, t)
+}
+
+func TestMillUsesSinglePackageWorker(t *testing.T) {
+	tests := []struct {
+		name    string
+		loggers int
+		want    int
+	}{
+		{
+			name:    "many loggers share one worker",
+			loggers: 3,
+			want:    1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for range tt.loggers {
+				(&Logger{}).mill()
+			}
+			waitForMillWorkers(tt.want, t)
+			equals(tt.want, millWorkerCount(), t)
+		})
+	}
 }
 
 func TestAutoRotate(t *testing.T) {
@@ -1267,4 +1292,21 @@ func removeFile(path string) {
 
 func closeLogger(l *Logger) {
 	_ = l.Close()
+}
+
+func waitForMillWorkers(want int, t testing.TB) {
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if millWorkerCount() == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	equals(want, millWorkerCount(), t)
+}
+
+func millWorkerCount() int {
+	buf := make([]byte, 1<<20)
+	n := runtime.Stack(buf, true)
+	return bytes.Count(buf[:n], []byte("github.com/gitkit/logrotate.millRun"))
 }
