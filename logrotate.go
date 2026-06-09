@@ -1,20 +1,15 @@
-// Package logrotate provides a rolling logger.
+// Package logrotate 提供日志文件写入、切割、压缩和清理能力。
 //
-// Import logrotate using:
+// 使用方式：
 //
 //	import "github.com/gitkit/logrotate"
 //
-// Logrotate is intended to be one part of a logging infrastructure.
-// It is not an all-in-one solution, but instead is a pluggable
-// component at the bottom of the logging stack that simply controls the files
-// to which logs are written.
+// logrotate 只负责日志文件输出端的管理，不负责日志格式化、日志级别或字段编码。
+// 它可以作为任何接收 io.Writer 的日志库输出目标，例如标准库 log、slog、
+// zap 和 logrus。
 //
-// Logrotate plays well with any logging package that can write to an
-// io.Writer, including the standard library's log package.
-//
-// Logrotate assumes that only one process is writing to the output files.
-// Using the same logrotate configuration from multiple processes on the same
-// machine will result in improper behavior.
+// 同一份日志文件只能由一个进程写入。多个进程使用相同配置写入同一文件会导致
+// 不正确的轮转行为。
 package logrotate
 
 import (
@@ -37,97 +32,70 @@ const (
 	defaultMaxSize   = 100
 )
 
-// ensure we always implement io.WriteCloser
+// 确保 Logger 实现 io.WriteCloser。
 var _ io.WriteCloser = (*Logger)(nil)
 
-// Logger is an io.WriteCloser that writes to the specified filename.
+// Logger 是写入指定日志文件的 io.WriteCloser。
 //
-// Logger opens or creates the logfile on first Write.  If the file exists and
-// is less than MaxSize megabytes, logrotate will open and append to that file.
-// If the file exists and its size is >= MaxSize megabytes, the file is renamed
-// by putting the current time in a timestamp in the name immediately before the
-// file's extension (or the end of the filename if there's no extension). A new
-// log file is then created using original filename.
+// Logger 会在首次 Write 时打开或创建日志文件。如果文件已存在且小于 MaxSize
+// 兆字节，Logger 会追加写入该文件。如果文件大小大于或等于 MaxSize，Logger
+// 会在文件扩展名前加入当前时间戳作为备份文件名，并用原始文件名创建新的日志文件。
 //
-// Whenever a write would cause the current log file exceed MaxSize megabytes,
-// the current file is closed, renamed, and a new log file created with the
-// original name. Thus, the filename you give Logger is always the "current" log
-// file.
+// 当一次写入会导致当前日志文件超过 MaxSize 时，Logger 会关闭当前文件、重命名为
+// 备份文件，并用原始文件名创建新文件。因此 Filename 始终表示当前活跃日志文件。
 //
-// If Daily is true, the current file is also rotated when the current day
-// changes. The day boundary uses UTC by default, or local time when LocalTime
-// is true. MaxSize still applies, so a logger can rotate both at day boundaries
-// and when the current day's file grows too large.
+// 如果 Daily 为 true，Logger 会在日期变化时轮转当前文件。日期边界默认使用 UTC，
+// LocalTime 为 true 时使用本地时间。MaxSize 仍然生效，因此可以同时按天和按大小
+// 轮转。
 //
-// If DailyFilename is true, the active log file name includes the current date
-// in the form `name-2006-01-02.ext`. At day boundaries, Logger closes the old
-// dated file and starts writing to the new day's dated file. MaxSize still
-// applies within each day, and size-based backups keep the normal timestamped
-// backup format.
+// 如果 DailyFilename 为 true，活跃日志文件名会包含当前日期，格式为
+// `name-2006-01-02.ext`。跨天时 Logger 会关闭旧日期文件，并开始写入新日期文件。
+// MaxSize 在每天的文件内仍然生效，按大小生成的备份仍使用普通时间戳格式。
 //
-// Backups use the log file name given to Logger, in the form
-// `name-timestamp.ext` where name is the filename without the extension,
-// timestamp is the time at which the log was rotated formatted with the
-// time.Time format of `2006-01-02T15-04-05.000` and the extension is the
-// original extension.  For example, if your Logger.Filename is
-// `/var/log/foo/server.log`, a backup created at 6:30pm on Nov 11 2016 would
-// use the filename `/var/log/foo/server-2016-11-04T18-30-00.000.log`
+// 备份文件使用 Logger 的日志文件名生成，格式为 `name-timestamp.ext`。其中 name
+// 是不含扩展名的文件名，timestamp 是轮转时间，格式为 `2006-01-02T15-04-05.000`，
+// ext 是原始扩展名。例如 Filename 为 `/var/log/foo/server.log` 时，备份文件可能是
+// `/var/log/foo/server-2026-06-09T10-30-00.000.log`。
 //
-// # Cleaning Up Old Log Files
+// # 清理旧日志文件
 //
-// Whenever a new logfile gets created, old log files may be deleted.  The most
-// recent files according to the encoded timestamp will be retained, up to a
-// number equal to MaxBackups (or all of them if MaxBackups is 0).  Any files
-// with an encoded timestamp older than MaxAge days are deleted, regardless of
-// MaxBackups.  Note that the time encoded in the timestamp is the rotation
-// time, which may differ from the last time that file was written to.
+// 每次创建新日志文件后，Logger 可能会删除旧日志。按文件名里的时间戳排序后，最多
+// 保留 MaxBackups 组旧日志；MaxBackups 为 0 时不按数量删除。时间戳早于 MaxAge
+// 天的旧日志会被删除；MaxAge 为 0 时不按时间删除。文件名里的时间是轮转时间，
+// 可能不同于该文件最后一次写入的时间。
 //
-// If MaxBackups and MaxAge are both 0, no old log files will be deleted.
+// 如果 MaxBackups 和 MaxAge 都是 0，不会自动删除旧日志。
 //
-// Logger serializes concurrent writes to preserve size accounting, rotation
-// decisions, and write order. Set exported configuration fields before first use
-// and do not modify them concurrently with Write, Rotate, or Close.
+// Logger 会串行化并发写入，以保证大小统计、轮转判断和写入顺序一致。请在首次使用前
+// 设置好导出的配置字段，使用过程中不要与 Write、Rotate 或 Close 并发修改这些字段。
 type Logger struct {
-	// Filename is the file to write logs to.  Backup log files will be retained
-	// in the same directory.  It uses <processname>-logrotate.log in
-	// os.TempDir() if empty.
+	// Filename 是当前活跃日志文件路径。备份日志会保存在同一目录。
+	// 为空时使用 os.TempDir() 下的 <进程名>-logrotate.log。
 	Filename string `json:"filename" yaml:"filename"`
 
-	// MaxSize is the maximum size in megabytes of the log file before it gets
-	// rotated. It defaults to 100 megabytes.
+	// MaxSize 是单个日志文件轮转前的最大大小，单位 MB。默认值为 100。
 	MaxSize int `json:"maxsize" yaml:"maxsize"`
 
-	// MaxAge is the maximum number of days to retain old log files based on the
-	// timestamp encoded in their filename.  Note that a day is defined as 24
-	// hours and may not exactly correspond to calendar days due to daylight
-	// savings, leap seconds, etc. The default is not to remove old log files
-	// based on age.
+	// MaxAge 是旧日志最多保留天数，基于文件名里的时间戳计算。
+	// 一天按 24 小时计算，可能与夏令时、闰秒等日历边界不完全一致。
+	// 默认不按时间删除旧日志。
 	MaxAge int `json:"maxage" yaml:"maxage"`
 
-	// MaxBackups is the maximum number of old log files to retain.  The default
-	// is to retain all old log files (though MaxAge may still cause them to get
-	// deleted.)
+	// MaxBackups 是最多保留的旧日志数量。默认保留全部旧日志，但 MaxAge 仍可能删除它们。
 	MaxBackups int `json:"maxbackups" yaml:"maxbackups"`
 
-	// LocalTime determines if the time used for formatting the timestamps in
-	// backup files is the computer's local time.  The default is to use UTC
-	// time.
+	// LocalTime 控制备份时间戳和日期文件名是否使用本地时间。默认使用 UTC。
 	LocalTime bool `json:"localtime" yaml:"localtime"`
 
-	// Compress determines if the rotated log files should be compressed
-	// using gzip. The default is not to perform compression.
+	// Compress 控制轮转后的旧日志是否使用 gzip 压缩。默认不压缩。
 	Compress bool `json:"compress" yaml:"compress"`
 
-	// Daily determines if the log file should be rotated when the current day
-	// changes. The day boundary is evaluated in UTC by default, or in the
-	// local timezone when LocalTime is true. The default is not to rotate based
-	// on day boundaries.
+	// Daily 控制是否在日期变化时轮转日志文件。日期边界默认按 UTC 判断，
+	// LocalTime 为 true 时按本地时区判断。默认不按天轮转。
 	Daily bool `json:"daily" yaml:"daily"`
 
-	// DailyFilename determines if the active log file name should include the
-	// current date in the form name-2006-01-02.ext. The date uses UTC by
-	// default, or the local timezone when LocalTime is true. MaxSize still
-	// applies within each day.
+	// DailyFilename 控制活跃日志文件名是否包含当前日期，格式为 name-2006-01-02.ext。
+	// 日期默认使用 UTC，LocalTime 为 true 时使用本地时区。MaxSize 在每天的文件内仍然生效。
 	DailyFilename bool `json:"dailyfilename" yaml:"dailyfilename"`
 
 	size           int64
@@ -140,10 +108,10 @@ type Logger struct {
 }
 
 var (
-	// currentTime exists so it can be mocked out by tests.
+	// currentTime 用于测试中替换当前时间。
 	currentTime = time.Now
 
-	// os_Stat exists so it can be mocked out by tests.
+	// osStat 用于测试中替换 os.Stat。
 	osStat = os.Stat
 
 	millMu      sync.Mutex
@@ -151,16 +119,14 @@ var (
 	millPending map[*Logger]struct{}
 	startMill   sync.Once
 
-	// megabyte is the conversion factor between MaxSize and bytes.  It is a
-	// variable so tests can mock it out and not need to write megabytes of data
-	// to disk.
+	// megabyte 是 MaxSize 与字节数之间的换算系数。
+	// 测试会替换它，以避免实际写入大量数据。
 	megabyte = 1024 * 1024
 )
 
-// Write implements io.Writer.  If a write would cause the log file to be larger
-// than MaxSize, the file is closed, renamed to include a timestamp of the
-// current time, and a new log file is created using the original log file name.
-// If the length of the write is greater than MaxSize, an error is returned.
+// Write 实现 io.Writer。写入会导致当前日志文件超过 MaxSize 时，Logger 会关闭当前文件、
+// 将其重命名为带时间戳的备份文件，并用原始文件名创建新日志文件。
+// 如果单次写入长度超过 MaxSize，Write 返回错误。
 func (l *Logger) Write(p []byte) (n int, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -196,14 +162,14 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 	return n, err
 }
 
-// Close implements io.Closer, and closes the current logfile.
+// Close 实现 io.Closer，并关闭当前打开的日志文件。
 func (l *Logger) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.close()
 }
 
-// close closes the file if it is open.
+// close 关闭当前打开的文件。
 func (l *Logger) close() error {
 	if l.file == nil {
 		return nil
@@ -213,20 +179,17 @@ func (l *Logger) close() error {
 	return err
 }
 
-// Rotate causes Logger to close the existing log file and immediately create a
-// new one.  This is a helper function for applications that want to initiate
-// rotations outside of the normal rotation rules, such as in response to
-// SIGHUP.  After rotating, this initiates compression and removal of old log
-// files according to the configuration.
+// Rotate 关闭现有日志文件并立即创建新文件。
+// 应用可以用它在正常轮转规则之外主动触发轮转，例如响应 SIGHUP。
+// 轮转后，Logger 会按配置触发旧日志压缩和清理。
 func (l *Logger) Rotate() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.rotate()
 }
 
-// rotate closes the current file, moves it aside with a timestamp in the name,
-// (if it exists), opens a new file with the original filename, and then runs
-// post-rotation processing and removal.
+// rotate 关闭当前文件，将已有文件重命名为带时间戳的备份文件，随后用原始文件名
+// 打开新文件并触发轮转后的处理。
 func (l *Logger) rotate() error {
 	if err := l.close(); err != nil {
 		return err
@@ -238,8 +201,8 @@ func (l *Logger) rotate() error {
 	return nil
 }
 
-// openNew opens a new log file for writing, moving any old log file out of the
-// way.  This methods assumes the file has already been closed.
+// openNew 打开新的日志文件用于写入，并在需要时移走旧文件。
+// 调用方必须确保当前文件已经关闭。
 func (l *Logger) openNew() error {
 	err := os.MkdirAll(l.dir(), 0755)
 	if err != nil {
@@ -253,23 +216,22 @@ func (l *Logger) openNew() error {
 	mode := os.FileMode(0600)
 	info, err := osStat(name)
 	if err == nil {
-		// Copy the mode off the old logfile.
+		// 继承旧日志文件的权限。
 		mode = info.Mode()
-		// move the existing file
+		// 移走已有文件。
 		newname := backupName(name, l.LocalTime)
 		if err := os.Rename(name, newname); err != nil {
 			return fmt.Errorf("can't rename log file: %s", err)
 		}
 
-		// this is a no-op anywhere but linux
+		// 仅 Linux 会保留所有者，其他平台是空操作。
 		if err := chown(name, info); err != nil {
 			return err
 		}
 	}
 
-	// we use truncate here because this should only get called when we've moved
-	// the file ourselves. if someone else creates the file in the meantime,
-	// just wipe out the contents.
+	// 这里使用 truncate，因为调用到此处时旧文件应已由本包移走。
+	// 如果期间有其他写入方创建了同名文件，则直接清空它。
 	f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 	if err != nil {
 		return fmt.Errorf("can't open new logfile: %s", err)
@@ -280,9 +242,8 @@ func (l *Logger) openNew() error {
 	return nil
 }
 
-// backupName creates a new filename from the given name, inserting a timestamp
-// between the filename and the extension, using the local time if requested
-// (otherwise UTC).
+// backupName 基于给定文件名生成备份文件名，并在文件名和扩展名之间插入时间戳。
+// local 为 true 时使用本地时间，否则使用 UTC。
 func backupName(name string, local bool) string {
 	dir := filepath.Dir(name)
 	filename := filepath.Base(name)
@@ -297,9 +258,8 @@ func backupName(name string, local bool) string {
 	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
 }
 
-// openExistingOrNew opens the logfile if it exists and if the current write
-// would not put it over MaxSize.  If there is no such file or the write would
-// put it over the MaxSize, a new file is created.
+// openExistingOrNew 在已有日志文件存在且本次写入不会超过 MaxSize 时打开它。
+// 如果文件不存在，或本次写入会让它超过 MaxSize，则创建新文件。
 func (l *Logger) openExistingOrNew(writeLen int) error {
 	l.mill()
 
@@ -321,8 +281,7 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 
 	file, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
-		// if we fail to open the old log file for some reason, just ignore
-		// it and open a new log file.
+		// 如果旧日志文件无法打开，则忽略旧文件并创建新日志文件。
 		return l.openNew()
 	}
 	l.file = file
@@ -331,7 +290,7 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 	return nil
 }
 
-// filename generates the name of the logfile from the current time.
+// filename 根据当前配置生成活跃日志文件名。
 func (l *Logger) filename() string {
 	if l.DailyFilename {
 		if name := l.currentActiveFilename(); name != "" {
@@ -350,10 +309,8 @@ func (l *Logger) baseFilename() string {
 	return filepath.Join(os.TempDir(), name)
 }
 
-// millRunOnce performs compression and removal of stale log files.
-// Log files are compressed if enabled via configuration and old log
-// files are removed, keeping at most l.MaxBackups files, as long as
-// none of them are older than MaxAge.
+// millRunOnce 执行一次旧日志压缩和清理。
+// 启用 Compress 时压缩旧日志，并按照 MaxBackups 和 MaxAge 删除过期日志。
 func (l *Logger) millRunOnce() error {
 	if l.MaxBackups == 0 && l.MaxAge == 0 && !l.Compress {
 		return nil
@@ -370,8 +327,7 @@ func (l *Logger) millRunOnce() error {
 		preserved := make(map[string]bool)
 		var remaining []logInfo
 		for _, f := range files {
-			// Only count the uncompressed log file or the
-			// compressed log file, not both.
+			// 同一组日志只统计未压缩文件或压缩文件之一，避免重复计数。
 			fn := f.Name()
 			fn = strings.TrimSuffix(fn, compressSuffix)
 			preserved[fn] = true
@@ -424,8 +380,7 @@ func (l *Logger) millRunOnce() error {
 	return err
 }
 
-// millRun runs in a goroutine to manage post-rotation compression and removal
-// of old log files.
+// millRun 在后台 goroutine 中处理轮转后的旧日志压缩和清理。
 func millRun() {
 	for range millCh {
 		for {
@@ -440,14 +395,13 @@ func millRun() {
 			if l == nil {
 				break
 			}
-			// what am I going to do, log this?
+			// 后台清理失败没有可用日志输出，只能忽略。
 			_ = l.millRunOnce()
 		}
 	}
 }
 
-// mill performs post-rotation compression and removal of stale log files,
-// starting the mill goroutine if necessary.
+// mill 调度轮转后的旧日志压缩和清理，并在需要时启动后台 worker。
 func (l *Logger) mill() {
 	startMill.Do(func() {
 		millCh = make(chan struct{}, 1)
@@ -463,8 +417,7 @@ func (l *Logger) mill() {
 	}
 }
 
-// oldLogFiles returns the list of backup log files stored in the same
-// directory as the current log file, sorted by ModTime
+// oldLogFiles 返回与当前日志文件同目录下的备份日志文件列表，按文件名时间排序。
 func (l *Logger) oldLogFiles() ([]logInfo, error) {
 	entries, err := os.ReadDir(l.dir())
 	if err != nil {
@@ -494,8 +447,7 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 			logFiles = append(logFiles, logInfo{t, info})
 			continue
 		}
-		// error parsing means that the suffix at the end was not generated
-		// by logrotate, and therefore it's not a backup file.
+		// 解析失败说明后缀不是本包生成的备份格式，因此不是备份日志文件。
 	}
 
 	sort.Sort(byFormatTime(logFiles))
@@ -503,9 +455,7 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 	return logFiles, nil
 }
 
-// timeFromName extracts the formatted time from the filename by stripping off
-// the filename's prefix and extension. This prevents someone's filename from
-// confusing time.parse.
+// timeFromName 去掉文件名前缀和扩展名后解析时间戳，避免文件名中的其他内容干扰解析。
 func (l *Logger) timeFromName(filename, prefix, ext string) (time.Time, error) {
 	if !strings.HasPrefix(filename, prefix) {
 		return time.Time{}, errors.New("mismatched prefix")
@@ -562,8 +512,7 @@ func (l *Logger) timeFromDailyFilename(filename, prefix, ext string) (time.Time,
 	return time.Time{}, errors.New("mismatched daily filename")
 }
 
-// shouldRotateByDay reports whether the open log file has crossed the next day
-// boundary configured for this logger.
+// shouldRotateByDay 判断已打开日志文件是否跨过下一个日期边界。
 func (l *Logger) shouldRotateByDay() bool {
 	if !l.Daily || l.DailyFilename {
 		return false
@@ -579,8 +528,7 @@ func (l *Logger) shouldRotateByDay() bool {
 	return !now.Before(l.nextRotateTime)
 }
 
-// existingFileIsOld reports whether an existing current log file belongs to a
-// previous day and should be rotated before the first write after startup.
+// existingFileIsOld 判断已有活跃日志文件是否属于旧日期，启动后首次写入前是否应先轮转。
 func (l *Logger) existingFileIsOld(info os.FileInfo) bool {
 	if !l.Daily || l.DailyFilename {
 		return false
@@ -599,8 +547,7 @@ func (l *Logger) existingFileIsOld(info os.FileInfo) bool {
 	return modTime.Before(startOfDay(now))
 }
 
-// setNextRotateTime sets the next day boundary for an opened or newly created
-// current log file.
+// setNextRotateTime 为已打开或新建的活跃日志文件设置下一个日期边界。
 func (l *Logger) setNextRotateTime() {
 	if !l.Daily && !l.DailyFilename {
 		l.nextRotateTime = time.Time{}
@@ -645,7 +592,7 @@ func (l *Logger) switchDailyFilename(writeLen int) error {
 	return l.openExistingOrNew(writeLen)
 }
 
-// max returns the maximum size in bytes of log files before rolling.
+// max 返回日志文件轮转前的最大字节数。
 func (l *Logger) max() int64 {
 	if l.MaxSize == 0 {
 		return int64(defaultMaxSize * megabyte)
@@ -653,13 +600,12 @@ func (l *Logger) max() int64 {
 	return int64(l.MaxSize) * int64(megabyte)
 }
 
-// dir returns the directory for the current filename.
+// dir 返回当前基础文件名所在目录。
 func (l *Logger) dir() string {
 	return filepath.Dir(l.baseFilename())
 }
 
-// prefixAndExt returns the filename part and extension part from the Logger's
-// filename.
+// prefixAndExt 返回 Logger 基础文件名的前缀和扩展名。
 func (l *Logger) prefixAndExt() (prefix, ext string) {
 	filename := filepath.Base(l.baseFilename())
 	ext = filepath.Ext(filename)
@@ -694,8 +640,7 @@ func (l *Logger) setCurrentFilename(name string) {
 	l.filenameMu.Unlock()
 }
 
-// compressLogFile compresses the given log file, removing the
-// uncompressed log file if successful.
+// compressLogFile 压缩指定日志文件，并在成功后删除未压缩文件。
 func compressLogFile(src, dst string) (err error) {
 	f, err := os.Open(src)
 	if err != nil {
@@ -714,8 +659,7 @@ func compressLogFile(src, dst string) (err error) {
 		return fmt.Errorf("failed to chown compressed log file: %v", err)
 	}
 
-	// If this file already exists, we presume it was created by
-	// a previous attempt to compress the log file.
+	// 如果目标文件已存在，视为之前压缩尝试留下的文件，直接覆盖。
 	gzf, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, fi.Mode())
 	if err != nil {
 		return fmt.Errorf("failed to open compressed log file: %v", err)
@@ -753,14 +697,13 @@ func compressLogFile(src, dst string) (err error) {
 	return nil
 }
 
-// logInfo is a convenience struct to return the filename and its embedded
-// timestamp.
+// logInfo 保存日志文件信息和文件名中的时间戳。
 type logInfo struct {
 	timestamp time.Time
 	os.FileInfo
 }
 
-// byFormatTime sorts by newest time formatted in the name.
+// byFormatTime 按文件名中的时间戳从新到旧排序。
 type byFormatTime []logInfo
 
 func (b byFormatTime) Less(i, j int) bool {

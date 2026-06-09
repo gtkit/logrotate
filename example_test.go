@@ -4,14 +4,13 @@ import (
 	"log"
 )
 
-// To use logrotate with the standard library's log package, just pass it into
-// the SetOutput function when your application starts.
+// 使用标准库 log 时，在应用启动时把 Logger 传给 SetOutput 即可。
 func Example() {
 	log.SetOutput(&Logger{
 		Filename:   "/var/log/myapp/foo.log",
-		MaxSize:    500, // megabytes
+		MaxSize:    500, // MB
 		MaxBackups: 3,
-		MaxAge:     28,   // days
-		Compress:   true, // disabled by default
+		MaxAge:     28,   // 天
+		Compress:   true, // 默认关闭
 	})
 }

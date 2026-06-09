@@ -5,14 +5,14 @@ import (
 	"syscall"
 )
 
-// osChown is a var so we can mock it out during tests.
+// osChown 用于测试中替换 os.Chown。
 var osChown = os.Chown
 
 type chownFile interface {
 	Close() error
 }
 
-// osOpenFile is a var so we can mock it out during tests.
+// osOpenFile 用于测试中替换 os.OpenFile。
 var osOpenFile = func(name string, flag int, perm os.FileMode) (chownFile, error) {
 	return os.OpenFile(name, flag, perm)
 }

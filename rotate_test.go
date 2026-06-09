@@ -10,7 +10,7 @@ import (
 	"syscall"
 )
 
-// Example of how to rotate in response to SIGHUP.
+// 响应 SIGHUP 时可以主动轮转日志文件。
 func ExampleLogger_Rotate() {
 	l := &Logger{}
 	log.SetOutput(l)
