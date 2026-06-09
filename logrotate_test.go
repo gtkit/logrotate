@@ -79,6 +79,216 @@ func TestSync(t *testing.T) {
 	isNil(l.Sync(), t)
 }
 
+func TestOpenCreatesFileAndCleansBacklog(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		{name: "open initializes active file and performs synchronous cleanup"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			megabyte = 1
+			setFakeTime(time.Date(2026, 6, 10, 10, 0, 0, 0, time.UTC))
+
+			dir := makeTempDir("TestOpenCreatesFileAndCleansBacklog", t)
+			defer removeAll(dir)
+
+			expired := dailyLogFileForDate(dir, "2026-01-01")
+			err := os.WriteFile(expired, []byte("expired"), 0o644)
+			isNil(err, t)
+
+			l := &Logger{
+				Filename:      logFile(dir),
+				MaxSize:       100,
+				MaxAge:        7,
+				DailyFilename: true,
+			}
+			defer closeLogger(l)
+
+			isNil(l.Open(), t)
+			notExist(expired, t)
+			existsWithContent(dailyLogFileAt(dir, fakeTime()), []byte{}, t)
+
+			b := []byte("after open")
+			n, err := l.Write(b)
+			isNil(err, t)
+			equals(len(b), n, t)
+			existsWithContent(dailyLogFileAt(dir, fakeTime()), b, t)
+		})
+	}
+}
+
+func TestCleanupReturnsError(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		{name: "cleanup reports directory read failure"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := makeTempDir("TestCleanupReturnsError", t)
+			removeAll(dir)
+
+			l := &Logger{
+				Filename:   logFile(dir),
+				MaxBackups: 1,
+			}
+
+			err := l.Cleanup()
+			assert(err != nil, t, "expected cleanup error")
+		})
+	}
+}
+
+func TestCurrentFilenameUsesInjectedNow(t *testing.T) {
+	tests := []struct {
+		name string
+		now  time.Time
+		want string
+	}{
+		{
+			name: "daily filename uses injected now",
+			now:  time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC),
+			want: "2030-01-02",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := makeTempDir("TestCurrentFilenameUsesInjectedNow", t)
+			defer removeAll(dir)
+
+			l := &Logger{
+				Filename:      logFile(dir),
+				DailyFilename: true,
+				Now:           func() time.Time { return tt.now },
+			}
+
+			equals(dailyLogFileForDate(dir, tt.want), l.CurrentFilename(), t)
+		})
+	}
+}
+
+func TestLocationControlsDailyFilenameAndBackupName(t *testing.T) {
+	tests := []struct {
+		name     string
+		location *time.Location
+		now      time.Time
+		wantDate string
+	}{
+		{
+			name:     "location is independent of host local time",
+			location: time.FixedZone("logrotate-test-plus8", 8*60*60),
+			now:      time.Date(2026, 6, 8, 16, 30, 0, 0, time.UTC),
+			wantDate: "2026-06-09",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := makeTempDir("TestLocationControlsDailyFilenameAndBackupName", t)
+			defer removeAll(dir)
+
+			l := &Logger{
+				Filename:      logFile(dir),
+				DailyFilename: true,
+				Location:      tt.location,
+				Now:           func() time.Time { return tt.now },
+			}
+
+			equals(dailyLogFileForDate(dir, tt.wantDate), l.CurrentFilename(), t)
+		})
+	}
+}
+
+func TestOnErrorReceivesBackgroundCleanupError(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		{name: "background cleanup reports error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := makeTempDir("TestOnErrorReceivesBackgroundCleanupError", t)
+			removeAll(dir)
+
+			errCh := make(chan error, 1)
+			l := &Logger{
+				Filename:   logFile(dir),
+				MaxBackups: 1,
+				OnError: func(err error) {
+					errCh <- err
+				},
+			}
+
+			l.millWG.Add(1)
+			l.runMillOnce()
+
+			select {
+			case err := <-errCh:
+				assert(err != nil, t, "expected background error")
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for OnError")
+			}
+		})
+	}
+}
+
+func TestCleanupUsesFilenameDateNotModTime(t *testing.T) {
+	tests := []struct {
+		name           string
+		files          map[string]time.Time
+		wantExists     []string
+		wantNotExists  []string
+		currentTimeUTC time.Time
+	}{
+		{
+			name: "filename date controls retention",
+			files: map[string]time.Time{
+				"2026-06-09": time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
+				"2020-01-01": time.Date(2026, 6, 9, 0, 0, 0, 0, time.UTC),
+			},
+			wantExists:     []string{"2026-06-09"},
+			wantNotExists:  []string{"2020-01-01"},
+			currentTimeUTC: time.Date(2026, 6, 10, 10, 0, 0, 0, time.UTC),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := makeTempDir("TestCleanupUsesFilenameDateNotModTime", t)
+			defer removeAll(dir)
+
+			for date, modTime := range tt.files {
+				name := dailyLogFileForDate(dir, date)
+				err := os.WriteFile(name, []byte(date), 0o644)
+				isNil(err, t)
+				err = os.Chtimes(name, modTime, modTime)
+				isNil(err, t)
+			}
+
+			l := &Logger{
+				Filename:      logFile(dir),
+				MaxAge:        2,
+				DailyFilename: true,
+				Now:           func() time.Time { return tt.currentTimeUTC },
+			}
+
+			isNil(l.Cleanup(), t)
+
+			for _, date := range tt.wantExists {
+				exists(dailyLogFileForDate(dir, date), t)
+			}
+			for _, date := range tt.wantNotExists {
+				notExist(dailyLogFileForDate(dir, date), t)
+			}
+		})
+	}
+}
+
 // TestRunMillOnceRecoversFromPanic 验证后台清理即使 panic，runMillOnce 也不会向外
 // 抛出 panic，且 millWG.Done 仍会执行——否则 Close 的 Wait 会永久阻塞。
 func TestRunMillOnceRecoversFromPanic(t *testing.T) {
@@ -1481,7 +1691,7 @@ func backupFile(dir string) string {
 }
 
 func backupFileLocal(dir string) string {
-	return filepath.Join(dir, "foobar-"+fakeTime().Format(backupTimeFormat)+".log")
+	return backupFileLocalAt(dir, fakeTime())
 }
 
 func backupFileAt(dir string, t time.Time) string {
@@ -1489,7 +1699,7 @@ func backupFileAt(dir string, t time.Time) string {
 }
 
 func backupFileLocalAt(dir string, t time.Time) string {
-	return filepath.Join(dir, "foobar-"+t.Format(backupTimeFormat)+".log")
+	return filepath.Join(dir, "foobar-"+t.In(time.Local).Format(backupTimeFormat)+".log")
 }
 
 func dailyLogFileAt(dir string, t time.Time) string {

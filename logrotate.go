@@ -100,6 +100,18 @@ type Logger struct {
 	// 日期默认使用 UTC，LocalTime 为 true 时使用本地时区。MaxSize 在每天的文件内仍然生效。
 	DailyFilename bool `json:"dailyfilename" yaml:"dailyfilename"`
 
+	// Now 返回当前时间。为空时使用 time.Now。
+	// 主要用于测试或需要固定业务时间源的场景。请在首次使用前设置。
+	Now func() time.Time `json:"-" yaml:"-"`
+
+	// Location 控制备份时间戳、日期文件名、日期边界和 MaxAge 截止时间使用的时区。
+	// 非空时优先于 LocalTime；为空且 LocalTime 为 true 时使用 time.Local；否则使用 UTC。
+	Location *time.Location `json:"-" yaml:"-"`
+
+	// OnError 接收后台清理、压缩或 panic recover 产生的错误。
+	// 为空时后台错误保持非致命并被忽略。Cleanup 返回的同步错误不会重复调用 OnError。
+	OnError func(error) `json:"-" yaml:"-"`
+
 	size           int64
 	file           *os.File
 	nextRotateTime time.Time
@@ -146,7 +158,7 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 	}
 
 	if l.file == nil {
-		if err = l.openExistingOrNew(len(p)); err != nil {
+		if err = l.openExistingOrNew(len(p), true); err != nil {
 			return 0, err
 		}
 	}
@@ -167,6 +179,23 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 	l.size += int64(n)
 
 	return n, err
+}
+
+// Open 打开或创建当前活跃日志文件，并同步执行一次旧日志清理/压缩。
+//
+// 调用 Open 可在应用启动时初始化目录、创建当前文件并清理历史积压文件，而无需等待首次
+// Write。Open 不会使 Logger 进入终止状态；Close 后仍可再次 Open 或 Write。
+// Open 期间不要并发调用 Write、Rotate 或 Close。
+func (l *Logger) Open() error {
+	l.mu.Lock()
+	if l.file == nil {
+		if err := l.openExistingOrNew(0, false); err != nil {
+			l.mu.Unlock()
+			return err
+		}
+	}
+	l.mu.Unlock()
+	return l.Cleanup()
 }
 
 // Close 实现 io.Closer，关闭当前打开的日志文件，并等待本 Logger 已调度的后台
@@ -200,6 +229,22 @@ func (l *Logger) Sync() error {
 	return l.file.Sync()
 }
 
+// Cleanup 同步执行一次旧日志压缩和清理，并返回遇到的第一个错误。
+//
+// Cleanup 不通过后台 worker 调度，也不会为返回的同步错误调用 OnError。需要启动即回收
+// 历史积压文件时，应用可以在完成配置后显式调用 Cleanup 或 Open。
+func (l *Logger) Cleanup() error {
+	return l.millRunOnce()
+}
+
+// CurrentFilename 返回当前活跃日志文件路径。
+//
+// DailyFilename 关闭时返回 Filename 或默认文件名；DailyFilename 开启时返回当前日期对应
+// 的活跃文件名。若内部已经切换到某个日期文件，则返回该文件名。
+func (l *Logger) CurrentFilename() string {
+	return l.filename()
+}
+
 // close 关闭当前打开的文件。
 func (l *Logger) close() error {
 	if l.file == nil {
@@ -222,13 +267,19 @@ func (l *Logger) Rotate() error {
 // rotate 关闭当前文件，将已有文件重命名为带时间戳的备份文件，随后用原始文件名
 // 打开新文件并触发轮转后的处理。
 func (l *Logger) rotate() error {
+	return l.rotateWithCleanup(true)
+}
+
+func (l *Logger) rotateWithCleanup(scheduleCleanup bool) error {
 	if err := l.close(); err != nil {
 		return err
 	}
 	if err := l.openNew(); err != nil {
 		return err
 	}
-	l.mill()
+	if scheduleCleanup {
+		l.mill()
+	}
 	return nil
 }
 
@@ -241,7 +292,7 @@ func (l *Logger) openNew() error {
 	}
 
 	if l.DailyFilename && l.currentActiveFilename() == "" {
-		l.setCurrentFilename(l.dailyFilename(currentTime()))
+		l.setCurrentFilename(l.dailyFilename(l.now()))
 	}
 	name := l.filename()
 	mode := os.FileMode(0o600)
@@ -250,7 +301,7 @@ func (l *Logger) openNew() error {
 		// 继承旧日志文件的权限。
 		mode = info.Mode()
 		// 移走已有文件。
-		newname := backupName(name, l.LocalTime)
+		newname := l.backupName(name)
 		if err := os.Rename(name, newname); err != nil {
 			return fmt.Errorf("can't rename log file: %w", err)
 		}
@@ -274,16 +325,12 @@ func (l *Logger) openNew() error {
 }
 
 // backupName 基于给定文件名生成备份文件名，并在文件名和扩展名之间插入时间戳。
-// local 为 true 时使用本地时间，否则使用 UTC。
-func backupName(name string, local bool) string {
+func (l *Logger) backupName(name string) string {
 	dir := filepath.Dir(name)
 	filename := filepath.Base(name)
 	ext := filepath.Ext(filename)
 	prefix := filename[:len(filename)-len(ext)]
-	t := currentTime()
-	if !local {
-		t = t.UTC()
-	}
+	t := l.clockTime()
 
 	timestamp := t.Format(backupTimeFormat)
 	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
@@ -291,11 +338,13 @@ func backupName(name string, local bool) string {
 
 // openExistingOrNew 在已有日志文件存在且本次写入不会超过 MaxSize 时打开它。
 // 如果文件不存在，或本次写入会让它超过 MaxSize，则创建新文件。
-func (l *Logger) openExistingOrNew(writeLen int) error {
-	l.mill()
+func (l *Logger) openExistingOrNew(writeLen int, scheduleCleanup bool) error {
+	if scheduleCleanup {
+		l.mill()
+	}
 
 	if l.DailyFilename && l.currentActiveFilename() == "" {
-		l.setCurrentFilename(l.dailyFilename(currentTime()))
+		l.setCurrentFilename(l.dailyFilename(l.now()))
 	}
 	filename := l.filename()
 	info, err := osStat(filename)
@@ -307,7 +356,7 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 	}
 
 	if l.existingFileIsOld(info) || info.Size()+int64(writeLen) >= l.max() {
-		return l.rotate()
+		return l.rotateWithCleanup(scheduleCleanup)
 	}
 
 	file, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY, 0o644)
@@ -327,7 +376,7 @@ func (l *Logger) filename() string {
 		if name := l.currentActiveFilename(); name != "" {
 			return name
 		}
-		return l.dailyFilename(currentTime())
+		return l.dailyFilename(l.now())
 	}
 	return l.baseFilename()
 }
@@ -373,7 +422,7 @@ func (l *Logger) millRunOnce() error {
 	}
 	if l.MaxAge > 0 {
 		diff := time.Duration(l.MaxAge) * 24 * time.Hour
-		cutoff := currentTime().Add(-diff)
+		cutoff := l.clockTime().Add(-diff)
 
 		var remaining []logInfo
 		for _, f := range files {
@@ -438,9 +487,13 @@ func (l *Logger) runMillOnce() {
 	defer l.millWG.Done()
 	defer func() {
 		// 后台清理失败没有可用日志输出，panic 也只能吞掉，避免影响其他 Logger。
-		_ = recover()
+		if recovered := recover(); recovered != nil {
+			l.reportError(fmt.Errorf("logrotate: background cleanup panic: %v", recovered))
+		}
 	}()
-	_ = l.millRunOnce()
+	if err := l.millRunOnce(); err != nil {
+		l.reportError(err)
+	}
 }
 
 // mill 调度轮转后的旧日志压缩和清理，并在需要时启动后台 worker。
@@ -511,7 +564,7 @@ func (l *Logger) timeFromName(filename, prefix, ext string) (time.Time, error) {
 		return time.Time{}, errors.New("mismatched extension")
 	}
 	ts := filename[len(prefix) : len(filename)-len(ext)]
-	return time.Parse(backupTimeFormat, ts)
+	return time.ParseInLocation(backupTimeFormat, ts, l.timeLocation())
 }
 
 func (l *Logger) oldDailyFilenameLogFiles(entries []os.DirEntry) ([]logInfo, error) {
@@ -551,10 +604,10 @@ func (l *Logger) timeFromDailyFilename(filename, prefix, ext string) (time.Time,
 
 	ts := filename[len(prefix) : len(filename)-len(ext)]
 	if len(ts) == len(dailyNameFormat) {
-		return time.Parse(dailyNameFormat, ts)
+		return time.ParseInLocation(dailyNameFormat, ts, l.timeLocation())
 	}
 	if len(ts) > len(dailyNameFormat)+1 && ts[len(dailyNameFormat)] == '-' {
-		return time.Parse(backupTimeFormat, ts[len(dailyNameFormat)+1:])
+		return time.ParseInLocation(backupTimeFormat, ts[len(dailyNameFormat)+1:], l.timeLocation())
 	}
 	return time.Time{}, errors.New("mismatched daily filename")
 }
@@ -568,12 +621,7 @@ func (l *Logger) shouldRotateByDay() bool {
 		l.setNextRotateTime()
 		return false
 	}
-	now := currentTime()
-	if l.LocalTime {
-		now = now.Local()
-	} else {
-		now = now.UTC()
-	}
+	now := l.clockTime()
 	return !now.Before(l.nextRotateTime)
 }
 
@@ -583,15 +631,9 @@ func (l *Logger) existingFileIsOld(info os.FileInfo) bool {
 		return false
 	}
 
-	now := currentTime()
+	now := l.clockTime()
 	modTime := info.ModTime()
-	if l.LocalTime {
-		now = now.Local()
-		modTime = modTime.Local()
-	} else {
-		now = now.UTC()
-		modTime = modTime.UTC()
-	}
+	modTime = modTime.In(now.Location())
 
 	return modTime.Before(startOfDay(now))
 }
@@ -603,12 +645,7 @@ func (l *Logger) setNextRotateTime() {
 		return
 	}
 
-	now := currentTime()
-	if l.LocalTime {
-		now = now.Local()
-	} else {
-		now = now.UTC()
-	}
+	now := l.clockTime()
 	l.nextRotateTime = startOfDay(now).Add(24 * time.Hour)
 }
 
@@ -624,12 +661,7 @@ func (l *Logger) shouldSwitchDailyFilename() bool {
 		l.setNextRotateTime()
 		return false
 	}
-	now := currentTime()
-	if l.LocalTime {
-		now = now.Local()
-	} else {
-		now = now.UTC()
-	}
+	now := l.clockTime()
 	return !now.Before(l.nextRotateTime)
 }
 
@@ -637,8 +669,8 @@ func (l *Logger) switchDailyFilename(writeLen int) error {
 	if err := l.close(); err != nil {
 		return err
 	}
-	l.setCurrentFilename(l.dailyFilename(currentTime()))
-	return l.openExistingOrNew(writeLen)
+	l.setCurrentFilename(l.dailyFilename(l.now()))
+	return l.openExistingOrNew(writeLen, true)
 }
 
 // max 返回日志文件轮转前的最大字节数。
@@ -663,11 +695,7 @@ func (l *Logger) prefixAndExt() (prefix, ext string) {
 }
 
 func (l *Logger) dailyFilename(t time.Time) string {
-	if l.LocalTime {
-		t = t.Local()
-	} else {
-		t = t.UTC()
-	}
+	t = l.withLocation(t)
 
 	name := l.baseFilename()
 	dir := filepath.Dir(name)
@@ -687,6 +715,45 @@ func (l *Logger) setCurrentFilename(name string) {
 	l.filenameMu.Lock()
 	l.currentFilename = name
 	l.filenameMu.Unlock()
+}
+
+func (l *Logger) now() time.Time {
+	if l.Now != nil {
+		return l.Now()
+	}
+	return currentTime()
+}
+
+func (l *Logger) clockTime() time.Time {
+	return l.withLocation(l.now())
+}
+
+func (l *Logger) withLocation(t time.Time) time.Time {
+	loc := l.timeLocation()
+	if loc == nil {
+		return t.UTC()
+	}
+	return t.In(loc)
+}
+
+func (l *Logger) timeLocation() *time.Location {
+	if l.Location != nil {
+		return l.Location
+	}
+	if l.LocalTime {
+		return time.Local
+	}
+	return time.UTC
+}
+
+func (l *Logger) reportError(err error) {
+	if err == nil || l.OnError == nil {
+		return
+	}
+	defer func() {
+		_ = recover()
+	}()
+	l.OnError(err)
 }
 
 // compressLogFile 压缩指定日志文件，并在成功后删除未压缩文件。

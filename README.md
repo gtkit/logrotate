@@ -11,6 +11,7 @@
 - 按天切割，活跃文件名带日期：通过 `DailyFilename` 写入 `app-2026-06-09.log` 这类日期文件。
 - 大小和按天组合切割：`MaxSize` 可以和 `Daily` / `DailyFilename` 同时生效。
 - 手动切割：通过 `Rotate()` 主动轮转，适合配合 `SIGHUP`。
+- 显式启动：通过 `Open()` 初始化文件并同步清理历史积压，通过 `Cleanup()` 单独触发清理。
 - 旧日志清理：通过 `MaxBackups` 限制旧文件数量，通过 `MaxAge` 限制保留天数。
 - 旧日志压缩：通过 `Compress` 将轮转后的旧日志压缩为 `.gz`。
 
@@ -78,6 +79,8 @@ func main() {
 package main
 
 import (
+	"time"
+
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -91,8 +94,11 @@ func main() {
 		MaxSize:       500,
 		MaxBackups:    14,
 		MaxAge:        30,
-		LocalTime:     true,
+		Location:      time.Local,
 		Compress:      true,
+	}
+	if err := w.Open(); err != nil {
+		panic(err)
 	}
 	defer w.Close()
 
@@ -148,7 +154,7 @@ w := &logrotate.Logger{
 	MaxSize:       500,
 	MaxBackups:    7,
 	MaxAge:        30,
-	LocalTime:     true,
+	Location:      time.Local,
 	Compress:      true,
 	Daily:         true,
 	DailyFilename: false,
@@ -162,9 +168,12 @@ w := &logrotate.Logger{
 | `MaxAge` | `0` | 旧日志最长保留天数；`0` 表示不按时间删除 |
 | `MaxBackups` | `0` | 最多保留旧日志数量；`0` 表示不按数量删除 |
 | `LocalTime` | `false` | 轮转时间和日期文件名默认使用 UTC；设为 `true` 后使用本地时间 |
+| `Location` | `nil` | 指定轮转时间、日期文件名和清理截止时间使用的时区；非空时优先于 `LocalTime` |
 | `Compress` | `false` | 是否用 gzip 压缩旧日志 |
 | `Daily` | `false` | 是否在跨天时轮转当前日志文件 |
 | `DailyFilename` | `false` | 当前活跃日志文件名是否带日期 |
+| `Now` | `nil` | 当前时间源；为空时使用 `time.Now`，主要用于测试 |
+| `OnError` | `nil` | 后台清理或压缩失败时的错误回调 |
 
 配置字段应在首次 `Write`、`Rotate` 或 `Close` 前设置好。开始使用后不要并发修改这些字段。
 
@@ -252,6 +261,29 @@ w := &logrotate.Logger{
 
 如果 `MaxBackups` 和 `MaxAge` 都是 `0`，不会自动删除旧日志。
 
+清理判断使用文件名中的日期或时间戳，不使用文件的修改时间。这样日志保留规则不受复制、解压、备份恢复或手工 `touch` 影响。按天文件使用 `app-2006-01-02.log` 里的日期；按大小备份使用 `app-2006-01-02T15-04-05.000.log` 里的时间戳。
+
+默认清理和压缩在后台执行，不阻塞 `Write()` / `Rotate()`。如果应用需要启动时立即回收历史积压文件，调用 `Open()`：
+
+```go
+w := &logrotate.Logger{
+	Filename:      "/var/log/myapp/app.log",
+	DailyFilename: true,
+	MaxAge:        30,
+	MaxBackups:    14,
+	Compress:      true,
+	OnError: func(err error) {
+		log.Printf("rotate cleanup: %v", err)
+	},
+}
+if err := w.Open(); err != nil {
+	log.Fatal(err)
+}
+defer w.Close()
+```
+
+只需要同步清理、不需要打开当前日志文件时，调用 `Cleanup()`。后台清理或压缩失败会传给 `OnError`；显式 `Cleanup()` 的失败直接通过返回值暴露。
+
 ## 手动轮转
 
 可以在收到 `SIGHUP` 时主动切割日志。
@@ -306,7 +338,7 @@ func NewFileWriter(path string) *logrotate.Logger {
 		MaxSize:       500,
 		MaxBackups:    14,
 		MaxAge:        30,
-		LocalTime:     true,
+		Location:      time.Local,
 		Compress:      true,
 	}
 }
@@ -335,6 +367,7 @@ func NewFileWriter(path string) *logrotate.Logger {
 - `Logger` 内部持有锁，首次使用后不得复制；请始终通过指针（`*logrotate.Logger`）传递和使用。
 - 配置字段必须在首次使用前设置完成，运行中不要并发修改。
 - 旧日志的压缩和清理在后台异步执行，不阻塞 `Write`。`Close()` 只等待本实例已调度的后台任务完成后才返回，不等待其他 `Logger` 实例的后台任务。
+- `Open()` 会初始化当前文件并同步执行清理；如果清理历史积压文件失败，错误会直接返回。
 - `Close()` 不会使 `Logger` 进入终止状态；之后再次 `Write` 会按现有配置重新打开日志文件。
 - 同一份日志文件只能由一个进程写入。多个进程使用相同 `Filename` 会导致不正确的轮转行为。
 
@@ -342,8 +375,11 @@ func NewFileWriter(path string) *logrotate.Logger {
 
 | 方法 | 说明 |
 |------|------|
+| `Open() error` | 打开或创建当前活跃文件，并同步执行一次旧日志清理/压缩 |
 | `Write(p []byte) (int, error)` | 写入日志内容，必要时自动轮转 |
 | `Rotate() error` | 立即手动轮转当前日志文件 |
+| `Cleanup() error` | 同步执行一次旧日志清理/压缩，并返回失败原因 |
+| `CurrentFilename() string` | 返回当前活跃日志文件路径 |
 | `Sync() error` | 将当前文件的内核缓冲刷写到磁盘，满足 `zapcore.WriteSyncer` 等需要 `Sync` 的接口 |
 | `Close() error` | 关闭当前打开的日志文件，并等待本实例已调度的后台清理/压缩完成后才返回；不会终止后续写入 |
 
