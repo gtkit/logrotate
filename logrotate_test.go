@@ -39,7 +39,6 @@ func setFakeTime(t time.Time) {
 }
 
 func TestNewFile(t *testing.T) {
-
 	dir := makeTempDir("TestNewFile", t)
 	defer removeAll(dir)
 	l := &Logger{
@@ -1308,5 +1307,5 @@ func waitForMillWorkers(want int, t testing.TB) {
 func millWorkerCount() int {
 	buf := make([]byte, 1<<20)
 	n := runtime.Stack(buf, true)
-	return bytes.Count(buf[:n], []byte("github.com/gitkit/logrotate.millRun"))
+	return bytes.Count(buf[:n], []byte("github.com/gtkit/logrotate.millRun"))
 }

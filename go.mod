@@ -1,3 +1,3 @@
-module github.com/gitkit/logrotate
+module github.com/gtkit/logrotate
 
 go 1.26

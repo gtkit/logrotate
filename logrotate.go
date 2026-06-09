@@ -2,7 +2,7 @@
 //
 // 使用方式：
 //
-//	import "github.com/gitkit/logrotate"
+//	import "github.com/gtkit/logrotate"
 //
 // logrotate 只负责日志文件输出端的管理，不负责日志格式化、日志级别或字段编码。
 // 它可以作为任何接收 io.Writer 的日志库输出目标，例如标准库 log、slog、
@@ -19,7 +19,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -204,16 +204,16 @@ func (l *Logger) rotate() error {
 // openNew 打开新的日志文件用于写入，并在需要时移走旧文件。
 // 调用方必须确保当前文件已经关闭。
 func (l *Logger) openNew() error {
-	err := os.MkdirAll(l.dir(), 0755)
+	err := os.MkdirAll(l.dir(), 0o755)
 	if err != nil {
-		return fmt.Errorf("can't make directories for new logfile: %s", err)
+		return fmt.Errorf("can't make directories for new logfile: %w", err)
 	}
 
 	if l.DailyFilename && l.currentActiveFilename() == "" {
 		l.setCurrentFilename(l.dailyFilename(currentTime()))
 	}
 	name := l.filename()
-	mode := os.FileMode(0600)
+	mode := os.FileMode(0o600)
 	info, err := osStat(name)
 	if err == nil {
 		// 继承旧日志文件的权限。
@@ -221,7 +221,7 @@ func (l *Logger) openNew() error {
 		// 移走已有文件。
 		newname := backupName(name, l.LocalTime)
 		if err := os.Rename(name, newname); err != nil {
-			return fmt.Errorf("can't rename log file: %s", err)
+			return fmt.Errorf("can't rename log file: %w", err)
 		}
 
 		// 仅 Linux 会保留所有者，其他平台是空操作。
@@ -234,7 +234,7 @@ func (l *Logger) openNew() error {
 	// 如果期间有其他写入方创建了同名文件，则直接清空它。
 	f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 	if err != nil {
-		return fmt.Errorf("can't open new logfile: %s", err)
+		return fmt.Errorf("can't open new logfile: %w", err)
 	}
 	l.file = f
 	l.size = 0
@@ -272,7 +272,7 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 		return l.openNew()
 	}
 	if err != nil {
-		return fmt.Errorf("error getting log file info: %s", err)
+		return fmt.Errorf("error getting log file info: %w", err)
 	}
 
 	if l.existingFileIsOld(info) || info.Size()+int64(writeLen) >= l.max() {
@@ -341,8 +341,8 @@ func (l *Logger) millRunOnce() error {
 		files = remaining
 	}
 	if l.MaxAge > 0 {
-		diff := time.Duration(int64(24*time.Hour) * int64(l.MaxAge))
-		cutoff := currentTime().Add(-1 * diff)
+		diff := time.Duration(l.MaxAge) * 24 * time.Hour
+		cutoff := currentTime().Add(-diff)
 
 		var remaining []logInfo
 		for _, f := range files {
@@ -421,7 +421,7 @@ func (l *Logger) mill() {
 func (l *Logger) oldLogFiles() ([]logInfo, error) {
 	entries, err := os.ReadDir(l.dir())
 	if err != nil {
-		return nil, fmt.Errorf("can't read log file directory: %s", err)
+		return nil, fmt.Errorf("can't read log file directory: %w", err)
 	}
 	logFiles := []logInfo{}
 
@@ -450,7 +450,7 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 		// 解析失败说明后缀不是本包生成的备份格式，因此不是备份日志文件。
 	}
 
-	sort.Sort(byFormatTime(logFiles))
+	sortByFormatTimeDesc(logFiles)
 
 	return logFiles, nil
 }
@@ -490,7 +490,7 @@ func (l *Logger) oldDailyFilenameLogFiles(entries []os.DirEntry) ([]logInfo, err
 		}
 	}
 
-	sort.Sort(byFormatTime(logFiles))
+	sortByFormatTimeDesc(logFiles)
 	return logFiles, nil
 }
 
@@ -644,7 +644,7 @@ func (l *Logger) setCurrentFilename(name string) {
 func compressLogFile(src, dst string) (err error) {
 	f, err := os.Open(src)
 	if err != nil {
-		return fmt.Errorf("failed to open log file: %v", err)
+		return fmt.Errorf("failed to open log file: %w", err)
 	}
 	defer func() {
 		_ = f.Close()
@@ -652,17 +652,17 @@ func compressLogFile(src, dst string) (err error) {
 
 	fi, err := osStat(src)
 	if err != nil {
-		return fmt.Errorf("failed to stat log file: %v", err)
+		return fmt.Errorf("failed to stat log file: %w", err)
 	}
 
 	if err := chown(dst, fi); err != nil {
-		return fmt.Errorf("failed to chown compressed log file: %v", err)
+		return fmt.Errorf("failed to chown compressed log file: %w", err)
 	}
 
 	// 如果目标文件已存在，视为之前压缩尝试留下的文件，直接覆盖。
 	gzf, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, fi.Mode())
 	if err != nil {
-		return fmt.Errorf("failed to open compressed log file: %v", err)
+		return fmt.Errorf("failed to open compressed log file: %w", err)
 	}
 	defer func() {
 		_ = gzf.Close()
@@ -673,7 +673,7 @@ func compressLogFile(src, dst string) (err error) {
 	defer func() {
 		if err != nil {
 			_ = os.Remove(dst)
-			err = fmt.Errorf("failed to compress log file: %v", err)
+			err = fmt.Errorf("failed to compress log file: %w", err)
 		}
 	}()
 
@@ -703,17 +703,9 @@ type logInfo struct {
 	os.FileInfo
 }
 
-// byFormatTime 按文件名中的时间戳从新到旧排序。
-type byFormatTime []logInfo
-
-func (b byFormatTime) Less(i, j int) bool {
-	return b[i].timestamp.After(b[j].timestamp)
-}
-
-func (b byFormatTime) Swap(i, j int) {
-	b[i], b[j] = b[j], b[i]
-}
-
-func (b byFormatTime) Len() int {
-	return len(b)
+// sortByFormatTimeDesc 按文件名中的时间戳从新到旧排序。
+func sortByFormatTimeDesc(files []logInfo) {
+	slices.SortFunc(files, func(a, b logInfo) int {
+		return b.timestamp.Compare(a.timestamp)
+	})
 }

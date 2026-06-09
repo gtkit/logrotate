@@ -17,7 +17,7 @@
 ## 安装
 
 ```bash
-go get github.com/gitkit/logrotate
+go get github.com/gtkit/logrotate
 ```
 
 ## 快速上手
@@ -30,7 +30,7 @@ package main
 import (
 	"log"
 
-	"github.com/gitkit/logrotate"
+	"github.com/gtkit/logrotate"
 )
 
 func main() {
@@ -56,7 +56,7 @@ package main
 import (
 	"log/slog"
 
-	"github.com/gitkit/logrotate"
+	"github.com/gtkit/logrotate"
 )
 
 func main() {
@@ -81,7 +81,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/gitkit/logrotate"
+	"github.com/gtkit/logrotate"
 )
 
 func main() {
@@ -117,7 +117,7 @@ package main
 import (
 	"github.com/sirupsen/logrus"
 
-	"github.com/gitkit/logrotate"
+	"github.com/gtkit/logrotate"
 )
 
 func main() {
@@ -265,7 +265,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/gitkit/logrotate"
+	"github.com/gtkit/logrotate"
 )
 
 func main() {
@@ -368,6 +368,8 @@ Filename: "/var/log/myapp/app.log"
 /var/log/myapp/app-2026-06-09.log
 ```
 
-## License
+## 致谢与来源
 
-见 [LICENSE](./LICENSE)。
+本包基于 [lumberjack](https://github.com/natefinch/lumberjack)（作者 Nate Finch，MIT 许可证）改造，在其文件切割、压缩、清理能力之上新增了按天切割（`Daily` / `DailyFilename`）等功能。感谢原作者的工作。
+
+## License
