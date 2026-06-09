@@ -170,7 +170,8 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 // 清理与压缩任务全部完成后才返回。
 //
 // 因此 Close 返回后，由本 Logger 触发的旧日志删除和压缩都已落盘，不会有清理
-// goroutine 在 Close 之后继续运行。Close 期间不要并发调用 Write 或 Rotate。
+// goroutine 在 Close 之后继续运行。Close 不会使 Logger 进入终止状态，之后的 Write
+// 可以按现有配置重新打开日志文件。Close 期间不要并发调用 Write 或 Rotate。
 func (l *Logger) Close() error {
 	l.mu.Lock()
 	err := l.close()
