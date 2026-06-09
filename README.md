@@ -331,6 +331,8 @@ func NewFileWriter(path string) *logrotate.Logger {
 
 - `Logger` 可以被多个 goroutine 并发写入。
 - 并发写入会被串行化，以保证文件大小统计、轮转判断和写入顺序一致。
+- `Write()`、`Rotate()`、`Close()` 之间需串行调用：`Close()` 或 `Rotate()` 期间不要并发调用 `Write()`，`Close()` 期间也不要并发调用 `Rotate()`。
+- `Logger` 内部持有锁，首次使用后不得复制；请始终通过指针（`*logrotate.Logger`）传递和使用。
 - 配置字段必须在首次使用前设置完成，运行中不要并发修改。
 - 旧日志的压缩和清理在后台异步执行，不阻塞 `Write`。`Close()` 只等待本实例已调度的后台任务完成后才返回，不等待其他 `Logger` 实例的后台任务。
 - `Close()` 不会使 `Logger` 进入终止状态；之后再次 `Write` 会按现有配置重新打开日志文件。

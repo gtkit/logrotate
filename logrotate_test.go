@@ -79,6 +79,44 @@ func TestSync(t *testing.T) {
 	isNil(l.Sync(), t)
 }
 
+// TestRunMillOnceRecoversFromPanic 验证后台清理即使 panic，runMillOnce 也不会向外
+// 抛出 panic，且 millWG.Done 仍会执行——否则 Close 的 Wait 会永久阻塞。
+func TestRunMillOnceRecoversFromPanic(t *testing.T) {
+	dir := makeTempDir("TestRunMillOnceRecoversFromPanic", t)
+	defer removeAll(dir)
+
+	// 放一个待压缩的备份文件，使 millRunOnce 走到 compressLogFile，并在其中触发 osStat。
+	backup := backupFileAt(dir, fakeTime())
+	err := os.WriteFile(backup, []byte("data"), 0o644)
+	isNil(err, t)
+
+	// 注入 panic：compressLogFile 会调用 osStat。
+	origStat := osStat
+	osStat = func(string) (os.FileInfo, error) { panic("injected mill panic") }
+	defer func() { osStat = origStat }()
+
+	l := &Logger{
+		Filename: logFile(dir),
+		Compress: true,
+	}
+
+	// 模拟 mill() 的入队计数；runMillOnce 不应向外 panic（recover 生效）。
+	l.millWG.Add(1)
+	l.runMillOnce()
+
+	// Done 已执行：用带超时的等待验证 millWG 没有卡住。
+	done := make(chan struct{})
+	go func() {
+		l.millWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("millWG.Wait 超时：runMillOnce 未调用 Done")
+	}
+}
+
 func TestCloseAllowsWriteAfterClose(t *testing.T) {
 	tests := []struct {
 		name string

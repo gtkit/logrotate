@@ -68,6 +68,8 @@ var _ io.WriteCloser = (*Logger)(nil)
 //
 // Logger 会串行化并发写入，以保证大小统计、轮转判断和写入顺序一致。请在首次使用前
 // 设置好导出的配置字段，使用过程中不要与 Write、Rotate 或 Close 并发修改这些字段。
+//
+// Logger 内部持有锁，首次使用后不得复制；请始终通过指针（*Logger）传递和使用。
 type Logger struct {
 	// Filename 是当前活跃日志文件路径。备份日志会保存在同一目录。
 	// 为空时使用 os.TempDir() 下的 <进程名>-logrotate.log。
@@ -170,9 +172,10 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 // Close 实现 io.Closer，关闭当前打开的日志文件，并等待本 Logger 已调度的后台
 // 清理与压缩任务全部完成后才返回。
 //
-// 因此 Close 返回后，由本 Logger 触发的旧日志删除和压缩都已落盘，不会有清理
-// goroutine 在 Close 之后继续运行。Close 不会使 Logger 进入终止状态，之后的 Write
-// 可以按现有配置重新打开日志文件。Close 期间不要并发调用 Write 或 Rotate。
+// 因此 Close 返回后，由本 Logger 触发的旧日志删除和压缩都已结束处理（清理或压缩
+// 自身的失败会被忽略，不保证一定成功），不会有清理 goroutine 在 Close 之后继续运行。
+// Close 不会使 Logger 进入终止状态，之后的 Write 可以按现有配置重新打开日志文件。
+// Close 期间不要并发调用 Write 或 Rotate。
 func (l *Logger) Close() error {
 	l.mu.Lock()
 	err := l.close()
