@@ -25,6 +25,11 @@ func chown(name string, info os.FileInfo) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	stat := info.Sys().(*syscall.Stat_t)
+	// 用 comma-ok 断言：非常规文件系统下 Sys() 可能不是 *syscall.Stat_t，
+	// 此时无法获知原属主，跳过 chown 而不是 panic。
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
 	return osChown(name, int(stat.Uid), int(stat.Gid))
 }

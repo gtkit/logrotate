@@ -136,9 +136,10 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 	defer l.mu.Unlock()
 
 	writeLen := int64(len(p))
-	if writeLen > l.max() {
+	maxSize := l.max()
+	if writeLen > maxSize {
 		return 0, fmt.Errorf(
-			"write length %d exceeds maximum file size %d", writeLen, l.max(),
+			"write length %d exceeds maximum file size %d", writeLen, maxSize,
 		)
 	}
 
@@ -154,7 +155,7 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 		}
 	}
 
-	if l.shouldRotateByDay() || l.size+writeLen > l.max() {
+	if l.shouldRotateByDay() || l.size+writeLen > maxSize {
 		if err := l.rotate(); err != nil {
 			return 0, err
 		}
@@ -422,12 +423,21 @@ func millRun() {
 			if l == nil {
 				break
 			}
-			// 后台清理失败没有可用日志输出，只能忽略。
-			_ = l.millRunOnce()
-			// 与 mill() 中的 Add 配对，通知 Close 这次调度已处理完毕。
-			l.millWG.Done()
+			l.runMillOnce()
 		}
 	}
+}
+
+// runMillOnce 执行一次后台清理，并保证无论 millRunOnce 是否 panic 都调用 millWG.Done，
+// 否则 Close 的 Wait 会永久阻塞。recover 同时防止单个 Logger 的意外 panic 拖垮全局 worker。
+func (l *Logger) runMillOnce() {
+	// 与 mill() 中的 Add 配对，通知 Close 这次调度已处理完毕。
+	defer l.millWG.Done()
+	defer func() {
+		// 后台清理失败没有可用日志输出，panic 也只能吞掉，避免影响其他 Logger。
+		_ = recover()
+	}()
+	_ = l.millRunOnce()
 }
 
 // mill 调度轮转后的旧日志压缩和清理，并在需要时启动后台 worker。
@@ -558,6 +568,8 @@ func (l *Logger) shouldRotateByDay() bool {
 	now := currentTime()
 	if l.LocalTime {
 		now = now.Local()
+	} else {
+		now = now.UTC()
 	}
 	return !now.Before(l.nextRotateTime)
 }

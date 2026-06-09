@@ -271,3 +271,25 @@ func (fs *fakeFS) Stat(name string) (os.FileInfo, error) {
 	stat.Gid = 666
 	return info, nil
 }
+
+// nonStatFileInfo 包装 os.FileInfo，使 Sys() 返回非 *syscall.Stat_t 的值。
+type nonStatFileInfo struct {
+	os.FileInfo
+}
+
+func (nonStatFileInfo) Sys() any { return nil }
+
+// TestChownSkipsWhenSysNotStat 验证：当 FileInfo.Sys() 不是 *syscall.Stat_t 时，
+// chown 跳过改属主并返回 nil，而不是 panic。
+func TestChownSkipsWhenSysNotStat(t *testing.T) {
+	dir := makeTempDir("TestChownSkipsWhenSysNotStat", t)
+	defer removeAll(dir)
+
+	name := logFile(dir)
+	err := os.WriteFile(name, []byte("x"), 0o644)
+	isNil(err, t)
+	info, err := os.Stat(name)
+	isNil(err, t)
+
+	isNil(chown(name, nonStatFileInfo{info}), t)
+}
