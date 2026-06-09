@@ -2,11 +2,14 @@
 
 
 LINT_TARGETS ?= ./...
-tool: ## Lint Go code with the installed golangci-lint
-	@ echo "▶️ golangci-lint run"
-	golangci-lint run $(LINT_TARGETS)
-	gofumpt -l -w .
-	@ echo "✅ golangci-lint run"
+tool: ## 本地静态检查，与 CI 对齐（gofmt + go vet + staticcheck，staticcheck 用 go run 免安装）
+	@ echo "▶️ gofmt"
+	gofmt -w .
+	@ echo "▶️ go vet"
+	go vet $(LINT_TARGETS)
+	@ echo "▶️ staticcheck"
+	go run honnef.co/go/tools/cmd/staticcheck@latest $(LINT_TARGETS)
+	@ echo "✅ lint done"
 
 ## govulncheck 检查漏洞 go install golang.org/x/vuln/cmd/govulncheck@latest
 check:

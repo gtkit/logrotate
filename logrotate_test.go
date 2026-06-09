@@ -1623,6 +1623,53 @@ func TestCompressOnResume(t *testing.T) {
 	fileCount(dir, 2, t)
 }
 
+// TestConcurrentCleanupSerializesCompression 验证并发触发的清理/压缩被 millRunMu 串行化：
+// 多个 goroutine 同时调用 Cleanup（与后台 mill 共用 millRunOnce 路径）不会交错压缩同一文件，
+// 因此每个备份都被压成可正常解压的 gzip，且没有 goroutine 返回因重复删除产生的 not-found 错误。
+func TestConcurrentCleanupSerializesCompression(t *testing.T) {
+	megabyte = 1
+
+	dir := makeTempDir("TestConcurrentCleanupSerializesCompression", t)
+	defer removeAll(dir)
+
+	l := &Logger{
+		Compress: true,
+		Filename: logFile(dir),
+		MaxSize:  10,
+	}
+	defer closeLogger(l)
+
+	// 预置若干未压缩备份文件，记录各自原始内容。
+	base := fakeTime().UTC()
+	backups := make(map[string][]byte)
+	for i := range 5 {
+		name := backupFileAt(dir, base.Add(-time.Duration(i+1)*time.Hour))
+		content := fmt.Appendf(nil, "backup-%d", i)
+		isNil(os.WriteFile(name, content, 0o644), t)
+		backups[name] = content
+	}
+
+	const goroutines = 20
+	var wg sync.WaitGroup
+	errs := make([]error, goroutines)
+	for i := range goroutines {
+		wg.Go(func() {
+			errs[i] = l.Cleanup()
+		})
+	}
+	wg.Wait()
+
+	for _, err := range errs {
+		isNil(err, t)
+	}
+
+	// 每个备份都应被压缩为可解压且内容正确的 .gz，原始未压缩文件已删除。
+	for name, content := range backups {
+		notExist(name, t)
+		existsWithContent(name+compressSuffix, gzippedContent(content, t), t)
+	}
+}
+
 func TestJSONTags(t *testing.T) {
 	tests := []struct {
 		name  string

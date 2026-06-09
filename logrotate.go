@@ -10,6 +10,24 @@
 //
 // 同一份日志文件只能由一个进程写入。多个进程使用相同配置写入同一文件会导致
 // 不正确的轮转行为。
+//
+// # 使用约束与已知限制
+//
+// 以下都是有意的设计取舍或该类库的固有约束：
+//
+//   - 配置字段不可热改：导出字段必须在首次 Open/Write/Rotate/Cleanup 之前设置好，
+//     运行中不要与这些操作并发修改，否则会发生 data race。需要不同配置请新建 Logger。
+//   - Open 是同步的：它会同步清理并压缩历史积压文件，积压多时启动会变慢，属于预期行为。
+//     不想承担该开销时可以不调用 Open，让首次 Write 走后台异步清理。
+//   - 后台清理是全局单 worker：所有 Logger 实例共享一个后台清理/压缩 goroutine，多实例
+//     同时压缩大文件会排队。副作用是 Close 等待本实例已调度的后台任务时，若该 worker 正
+//     忙于其他实例的压缩，本实例的 Close 也会一并等待后返回。
+//   - 保留判断只看文件名，不看 modTime：MaxAge 与 MaxBackups 按文件名中的日期/时间戳判断，
+//     不符合本包命名规则的文件会被忽略，既不会被清理也不会被误删。迁移老目录前请确认文件名
+//     符合规则，否则旧文件不会被自动回收。
+//   - 同一份日志文件只能单进程写：本包不加文件锁，多进程共用同一 Filename 会导致轮转竞争。
+//   - 同步清理无超时：Open 与 Close 的清理/压缩没有超时控制，磁盘 IO 病态时理论上会阻塞，
+//     属于已知边界。
 package logrotate
 
 import (
@@ -123,6 +141,11 @@ type Logger struct {
 	// millWG 跟踪本 Logger 已调度但尚未完成的后台清理/压缩任务，
 	// 使 Close 能等待这些任务结束，避免清理 goroutine 逃逸出 Logger 生命周期。
 	millWG sync.WaitGroup
+
+	// millRunMu 串行化 millRunOnce，使同步入口（Cleanup/Open）与后台 worker 不会
+	// 在同一 Logger 上并发删除或压缩同一批文件，避免压缩产物损坏与误导性的 not-found 错误。
+	// 单独使用一把锁而非复用 l.mu：清理是 I/O 密集操作，复用会长时间阻塞 Write。
+	millRunMu sync.Mutex
 }
 
 var (
@@ -392,6 +415,9 @@ func (l *Logger) baseFilename() string {
 // millRunOnce 执行一次旧日志压缩和清理。
 // 启用 Compress 时压缩旧日志，并按照 MaxBackups 和 MaxAge 删除过期日志。
 func (l *Logger) millRunOnce() error {
+	l.millRunMu.Lock()
+	defer l.millRunMu.Unlock()
+
 	if l.MaxBackups == 0 && l.MaxAge == 0 && !l.Compress {
 		return nil
 	}
