@@ -3,11 +3,12 @@ package logrotate
 import (
 	"bytes"
 	"compress/gzip"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -51,6 +52,67 @@ func TestNewFile(t *testing.T) {
 	equals(len(b), n, t)
 	existsWithContent(logFile(dir), b, t)
 	fileCount(dir, 1, t)
+}
+
+func TestSync(t *testing.T) {
+	dir := makeTempDir("TestSync", t)
+	defer removeAll(dir)
+
+	l := &Logger{
+		Filename: logFile(dir),
+	}
+	defer closeLogger(l)
+
+	// 没有打开文件时 Sync 应返回 nil。
+	isNil(l.Sync(), t)
+
+	b := []byte("boo!")
+	_, err := l.Write(b)
+	isNil(err, t)
+
+	// 写入后 Sync 应成功，且数据仍在文件中。
+	isNil(l.Sync(), t)
+	existsWithContent(logFile(dir), b, t)
+
+	// 关闭后再次 Sync 仍应返回 nil。
+	isNil(l.Close(), t)
+	isNil(l.Sync(), t)
+}
+
+func TestCloseAllowsWriteAfterClose(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		{name: "close is not terminal"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := makeTempDir("TestCloseAllowsWriteAfterClose", t)
+			defer removeAll(dir)
+
+			filename := logFile(dir)
+			l := &Logger{
+				Filename: filename,
+				MaxSize:  100,
+			}
+			defer closeLogger(l)
+
+			first := []byte("first")
+			n, err := l.Write(first)
+			isNil(err, t)
+			equals(len(first), n, t)
+
+			isNil(l.Close(), t)
+
+			second := []byte("second")
+			n, err = l.Write(second)
+			isNil(err, t)
+			equals(len(second), n, t)
+
+			existsWithContent(filename, append(first, second...), t)
+		})
+	}
 }
 
 func TestOpenExisting(t *testing.T) {
@@ -535,37 +597,182 @@ func TestDailyFilenameCleansAcrossDates(t *testing.T) {
 }
 
 func TestDailyFilenameMaxAgeCleansAcrossDates(t *testing.T) {
+	tests := []struct {
+		name           string
+		existingFiles  map[string][]byte
+		wantRemoved    []string
+		wantPreserved  []string
+		wantFileCount  int
+		currentContent []byte
+	}{
+		{
+			name: "removes expired plain and compressed daily files",
+			existingFiles: map[string][]byte{
+				"2026-06-01":    []byte("expired"),
+				"2026-06-02.gz": []byte("expired gz"),
+				"2026-06-09":    []byte("recent"),
+			},
+			wantRemoved:    []string{"2026-06-01", "2026-06-02.gz"},
+			wantPreserved:  []string{"2026-06-09"},
+			wantFileCount:  2,
+			currentContent: []byte("current"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			megabyte = 1
+			setFakeTime(time.Date(2026, 6, 10, 10, 0, 0, 0, time.UTC))
+
+			dir := makeTempDir("TestDailyFilenameMaxAgeCleansAcrossDates", t)
+			defer removeAll(dir)
+
+			for suffix, content := range tt.existingFiles {
+				name := dailyLogFileForDate(dir, strings.TrimSuffix(suffix, compressSuffix))
+				if strings.HasSuffix(suffix, compressSuffix) {
+					name += compressSuffix
+				}
+				err := os.WriteFile(name, content, 0o644)
+				isNil(err, t)
+			}
+
+			l := &Logger{
+				Filename:      logFile(dir),
+				MaxSize:       100,
+				MaxAge:        2,
+				DailyFilename: true,
+			}
+
+			n, err := l.Write(tt.currentContent)
+			isNil(err, t)
+			equals(len(tt.currentContent), n, t)
+			isNil(l.Close(), t)
+
+			for _, suffix := range tt.wantRemoved {
+				name := dailyLogFileForDate(dir, strings.TrimSuffix(suffix, compressSuffix))
+				if strings.HasSuffix(suffix, compressSuffix) {
+					name += compressSuffix
+				}
+				notExist(name, t)
+			}
+			for _, suffix := range tt.wantPreserved {
+				name := dailyLogFileForDate(dir, strings.TrimSuffix(suffix, compressSuffix))
+				if strings.HasSuffix(suffix, compressSuffix) {
+					name += compressSuffix
+				}
+				exists(name, t)
+			}
+			existsWithContent(dailyLogFileAt(dir, fakeTime()), tt.currentContent, t)
+			fileCount(dir, tt.wantFileCount, t)
+		})
+	}
+}
+
+// TestCloseWaitsForDailyCleanup 验证 Close 会等待后台清理完成。
+// 进程启动时已存在远超 MaxAge 的历史日切文件，首次 Write 触发清理后立即 Close，
+// 应能确定性断言过期文件已删除——无需 sleep。这等价于 logger
+// dailyWriteSyncer 的"启动即回收积压 + Close 等待在途 sweep"语义。
+func TestCloseWaitsForDailyCleanup(t *testing.T) {
 	megabyte = 1
 	setFakeTime(time.Date(2026, 6, 10, 10, 0, 0, 0, time.UTC))
 
-	dir := makeTempDir("TestDailyFilenameMaxAgeCleansAcrossDates", t)
+	dir := makeTempDir("TestCloseWaitsForDailyCleanup", t)
 	defer removeAll(dir)
 
-	expired := dailyLogFileForDate(dir, "2026-06-01")
-	recent := dailyLogFileForDate(dir, "2026-06-09")
+	expired := dailyLogFileForDate(dir, "2026-01-01")
 	err := os.WriteFile(expired, []byte("expired"), 0o644)
-	isNil(err, t)
-	err = os.WriteFile(recent, []byte("recent"), 0o644)
 	isNil(err, t)
 
 	l := &Logger{
 		Filename:      logFile(dir),
 		MaxSize:       100,
-		MaxAge:        2,
+		MaxAge:        7,
 		DailyFilename: true,
 	}
-	defer closeLogger(l)
 
 	b := []byte("current")
-	n, err := l.Write(b)
+	_, err = l.Write(b)
 	isNil(err, t)
-	equals(len(b), n, t)
-	<-time.After(100 * time.Millisecond)
+
+	// 不 sleep：Close 等待后台清理结束后才返回。
+	isNil(l.Close(), t)
 
 	notExist(expired, t)
-	exists(recent, t)
 	existsWithContent(dailyLogFileAt(dir, fakeTime()), b, t)
-	fileCount(dir, 2, t)
+}
+
+// TestDailyFilenameNoCleanupWhenLimitsZero 验证 MaxAge 与 MaxBackups 都为 0、
+// 且未启用压缩时，不删除任何历史日切文件。等价于 logger 的
+// TestCleanDailyFilesDisabledWhenBothZero。
+func TestDailyFilenameNoCleanupWhenLimitsZero(t *testing.T) {
+	megabyte = 1
+	setFakeTime(time.Date(2026, 6, 10, 10, 0, 0, 0, time.UTC))
+
+	dir := makeTempDir("TestDailyFilenameNoCleanupWhenLimitsZero", t)
+	defer removeAll(dir)
+
+	old := dailyLogFileForDate(dir, "2020-01-01")
+	err := os.WriteFile(old, []byte("old"), 0o644)
+	isNil(err, t)
+
+	l := &Logger{
+		Filename:      logFile(dir),
+		MaxSize:       100,
+		DailyFilename: true,
+	}
+
+	b := []byte("current")
+	_, err = l.Write(b)
+	isNil(err, t)
+	isNil(l.Close(), t)
+
+	exists(old, t) // 两项均为 0：清理关闭，不删任何文件
+}
+
+func TestDailyFilenameKeepsCurrentEvenIfOld(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		{name: "current daily file is excluded from cleanup"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			megabyte = 1
+			setFakeTime(time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC))
+
+			dir := makeTempDir("TestDailyFilenameKeepsCurrentEvenIfOld", t)
+			defer removeAll(dir)
+
+			current := dailyLogFileAt(dir, fakeTime())
+			err := os.WriteFile(current, []byte("old current"), 0o644)
+			isNil(err, t)
+
+			oldTime := fakeTime().Add(-100 * 24 * time.Hour)
+			err = os.Chtimes(current, oldTime, oldTime)
+			isNil(err, t)
+
+			expired := dailyLogFileForDate(dir, "2020-01-01")
+			err = os.WriteFile(expired, []byte("expired"), 0o644)
+			isNil(err, t)
+
+			l := &Logger{
+				Filename:      logFile(dir),
+				MaxSize:       100,
+				MaxAge:        1,
+				DailyFilename: true,
+			}
+
+			b := []byte("new")
+			n, err := l.Write(b)
+			isNil(err, t)
+			equals(len(b), n, t)
+			isNil(l.Close(), t)
+
+			exists(current, t)
+			notExist(expired, t)
+		})
+	}
 }
 
 func TestDailyFilenameCompressesSizeBackups(t *testing.T) {
@@ -593,19 +800,52 @@ func TestDailyFilenameCompressesSizeBackups(t *testing.T) {
 	n, err = l.Write(b2)
 	isNil(err, t)
 	equals(len(b2), n, t)
-	<-time.After(300 * time.Millisecond)
-
-	bc := new(bytes.Buffer)
-	gz := gzip.NewWriter(bc)
-	_, err = gz.Write(b)
-	isNil(err, t)
-	err = gz.Close()
-	isNil(err, t)
+	isNil(l.Close(), t)
 
 	existsWithContent(dailyLogFileAt(dir, fakeTime()), b2, t)
-	existsWithContent(dailyBackupFileAt(dir, rotateTime)+compressSuffix, bc.Bytes(), t)
+	existsWithContent(dailyBackupFileAt(dir, rotateTime)+compressSuffix, gzippedContent(b, t), t)
 	notExist(dailyBackupFileAt(dir, rotateTime), t)
 	fileCount(dir, 2, t)
+}
+
+func TestCloseWaitsForCompression(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		{name: "close waits for pending compression"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			megabyte = 1
+
+			dir := makeTempDir("TestCloseWaitsForCompression", t)
+			defer removeAll(dir)
+
+			filename := logFile(dir)
+			l := &Logger{
+				Compress: true,
+				Filename: filename,
+				MaxSize:  10,
+			}
+
+			b := []byte("boo!")
+			n, err := l.Write(b)
+			isNil(err, t)
+			equals(len(b), n, t)
+
+			newFakeTime()
+			err = l.Rotate()
+			isNil(err, t)
+
+			isNil(l.Close(), t)
+
+			existsWithContent(backupFile(dir)+compressSuffix, gzippedContent(b, t), t)
+			notExist(backupFile(dir), t)
+			existsWithContent(filename, []byte{}, t)
+			fileCount(dir, 2, t)
+		})
+	}
 }
 
 func TestDailyFilenameConcurrentCrossDaySwitch(t *testing.T) {
@@ -1114,13 +1354,7 @@ func TestCompressOnRotate(t *testing.T) {
 
 	// a compressed version of the log file should now exist and the original
 	// should have been removed.
-	bc := new(bytes.Buffer)
-	gz := gzip.NewWriter(bc)
-	_, err = gz.Write(b)
-	isNil(err, t)
-	err = gz.Close()
-	isNil(err, t)
-	existsWithContent(backupFile(dir)+compressSuffix, bc.Bytes(), t)
+	existsWithContent(backupFile(dir)+compressSuffix, gzippedContent(b, t), t)
 	notExist(backupFile(dir), t)
 
 	fileCount(dir, 2, t)
@@ -1162,42 +1396,36 @@ func TestCompressOnResume(t *testing.T) {
 
 	// The write should have started the compression - a compressed version of
 	// the log file should now exist and the original should have been removed.
-	bc := new(bytes.Buffer)
-	gz := gzip.NewWriter(bc)
-	_, err = gz.Write(b)
-	isNil(err, t)
-	err = gz.Close()
-	isNil(err, t)
-	existsWithContent(filename2+compressSuffix, bc.Bytes(), t)
+	existsWithContent(filename2+compressSuffix, gzippedContent(b, t), t)
 	notExist(filename2, t)
 
 	fileCount(dir, 2, t)
 }
 
-func TestJson(t *testing.T) {
-	data := []byte(`
-{
-	"filename": "foo",
-	"maxsize": 5,
-	"maxage": 10,
-	"maxbackups": 3,
-	"localtime": true,
-	"compress": true,
-	"daily": true,
-	"dailyfilename": true
-}`[1:])
+func TestJSONTags(t *testing.T) {
+	tests := []struct {
+		name  string
+		field string
+		tag   string
+	}{
+		{name: "filename", field: "Filename", tag: "filename"},
+		{name: "max size", field: "MaxSize", tag: "maxsize"},
+		{name: "max age", field: "MaxAge", tag: "maxage"},
+		{name: "max backups", field: "MaxBackups", tag: "maxbackups"},
+		{name: "local time", field: "LocalTime", tag: "localtime"},
+		{name: "compress", field: "Compress", tag: "compress"},
+		{name: "daily", field: "Daily", tag: "daily"},
+		{name: "daily filename", field: "DailyFilename", tag: "dailyfilename"},
+	}
 
-	l := Logger{}
-	err := json.Unmarshal(data, &l)
-	isNil(err, t)
-	equals("foo", l.Filename, t)
-	equals(5, l.MaxSize, t)
-	equals(10, l.MaxAge, t)
-	equals(3, l.MaxBackups, t)
-	equals(true, l.LocalTime, t)
-	equals(true, l.Compress, t)
-	equals(true, l.Daily, t)
-	equals(true, l.DailyFilename, t)
+	typ := reflect.TypeOf(Logger{})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			field, ok := typ.FieldByName(tt.field)
+			assert(ok, t, "missing field %s", tt.field)
+			equals(tt.tag, field.Tag.Get("json"), t)
+		})
+	}
 }
 
 // makeTempDir creates a file with a semi-unique name in the OS temp directory.
@@ -1219,6 +1447,16 @@ func existsWithContent(path string, content []byte, t testing.TB) {
 	b, err := os.ReadFile(path)
 	isNilUp(err, t, 1)
 	equalsUp(content, b, t, 1)
+}
+
+func gzippedContent(content []byte, t testing.TB) []byte {
+	bc := new(bytes.Buffer)
+	gz := gzip.NewWriter(bc)
+	_, err := gz.Write(content)
+	isNilUp(err, t, 1)
+	err = gz.Close()
+	isNilUp(err, t, 1)
+	return bc.Bytes()
 }
 
 // logFile returns the log file name in the given directory for the current fake

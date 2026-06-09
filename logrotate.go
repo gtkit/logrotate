@@ -105,6 +105,10 @@ type Logger struct {
 
 	filenameMu      sync.RWMutex
 	currentFilename string
+
+	// millWG 跟踪本 Logger 已调度但尚未完成的后台清理/压缩任务，
+	// 使 Close 能等待这些任务结束，避免清理 goroutine 逃逸出 Logger 生命周期。
+	millWG sync.WaitGroup
 }
 
 var (
@@ -162,11 +166,33 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 	return n, err
 }
 
-// Close 实现 io.Closer，并关闭当前打开的日志文件。
+// Close 实现 io.Closer，关闭当前打开的日志文件，并等待本 Logger 已调度的后台
+// 清理与压缩任务全部完成后才返回。
+//
+// 因此 Close 返回后，由本 Logger 触发的旧日志删除和压缩都已落盘，不会有清理
+// goroutine 在 Close 之后继续运行。Close 期间不要并发调用 Write 或 Rotate。
 func (l *Logger) Close() error {
 	l.mu.Lock()
+	err := l.close()
+	l.mu.Unlock()
+
+	// 在锁外等待后台清理/压缩，避免长时间持有 l.mu 阻塞其他操作；
+	// millRunOnce 不依赖 l.mu，因此不会死锁。
+	l.millWG.Wait()
+	return err
+}
+
+// Sync 将当前日志文件的内核缓冲刷写到磁盘。
+//
+// 它让 Logger 满足 zap 的 zapcore.WriteSyncer 等需要 Sync 的接口，可在需要持久化
+// 保证的场景显式调用。当前没有打开的文件时返回 nil。
+func (l *Logger) Sync() error {
+	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.close()
+	if l.file == nil {
+		return nil
+	}
+	return l.file.Sync()
 }
 
 // close 关闭当前打开的文件。
@@ -397,6 +423,8 @@ func millRun() {
 			}
 			// 后台清理失败没有可用日志输出，只能忽略。
 			_ = l.millRunOnce()
+			// 与 mill() 中的 Add 配对，通知 Close 这次调度已处理完毕。
+			l.millWG.Done()
 		}
 	}
 }
@@ -409,7 +437,12 @@ func (l *Logger) mill() {
 		go millRun()
 	})
 	millMu.Lock()
-	millPending[l] = struct{}{}
+	// 仅在首次入队时 Add：millPending 是 set，worker 对同一 Logger 只会处理一次，
+	// 所以 Add 必须与"真正入队"配对，否则 Close 的 Wait 会与 worker 的 Done 失衡。
+	if _, ok := millPending[l]; !ok {
+		l.millWG.Add(1)
+		millPending[l] = struct{}{}
+	}
 	millMu.Unlock()
 	select {
 	case millCh <- struct{}{}:

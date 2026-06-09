@@ -5,7 +5,10 @@
 ## [Unreleased]
 
 ### Added
+- 新增 `Sync()` 方法，将当前日志文件的内核缓冲刷写到磁盘，满足 `zapcore.WriteSyncer` 等需要 `Sync` 的接口。
+
 ### Changed
+- `Close()` 现在会等待本实例已调度的后台清理与压缩任务完成后才返回，确保 `Close` 之后不再有清理 goroutine 运行。
 ### Deprecated
 ### Removed
 ### Fixed

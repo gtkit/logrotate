@@ -332,6 +332,7 @@ func NewFileWriter(path string) *logrotate.Logger {
 - `Logger` 可以被多个 goroutine 并发写入。
 - 并发写入会被串行化，以保证文件大小统计、轮转判断和写入顺序一致。
 - 配置字段必须在首次使用前设置完成，运行中不要并发修改。
+- 旧日志的压缩和清理在后台异步执行，不阻塞 `Write`。`Close()` 会等待本实例已调度的后台任务完成后才返回，因此 `Close` 之后不会有清理 goroutine 继续运行。
 - 同一份日志文件只能由一个进程写入。多个进程使用相同 `Filename` 会导致不正确的轮转行为。
 
 ## API 概览
@@ -340,7 +341,8 @@ func NewFileWriter(path string) *logrotate.Logger {
 |------|------|
 | `Write(p []byte) (int, error)` | 写入日志内容，必要时自动轮转 |
 | `Rotate() error` | 立即手动轮转当前日志文件 |
-| `Close() error` | 关闭当前打开的日志文件 |
+| `Sync() error` | 将当前文件的内核缓冲刷写到磁盘，满足 `zapcore.WriteSyncer` 等需要 `Sync` 的接口 |
+| `Close() error` | 关闭当前打开的日志文件，并等待本实例已调度的后台清理/压缩完成后才返回 |
 
 ## 文件命名规则
 
