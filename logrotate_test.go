@@ -778,6 +778,71 @@ func TestDailyFilenameSwitchesOnDateChange(t *testing.T) {
 	fileCount(dir, 2, t)
 }
 
+// TestDailyFilenameCloseReopenAcrossDay 验证 Close 后跨天重新 Write 会写入
+// 新日期文件，而不是沿用缓存的旧日期文件名（回归 ERR-20260610-015）。
+func TestDailyFilenameCloseReopenAcrossDay(t *testing.T) {
+	setFakeTime(time.Date(2026, 6, 9, 10, 0, 0, 0, time.UTC))
+
+	dir := makeTempDir("TestDailyFilenameCloseReopenAcrossDay", t)
+	defer removeAll(dir)
+
+	l := &Logger{
+		Filename:      logFile(dir),
+		MaxSize:       100,
+		DailyFilename: true,
+	}
+	defer closeLogger(l)
+
+	b := []byte("day one")
+	n, err := l.Write(b)
+	isNil(err, t)
+	equals(len(b), n, t)
+	isNil(l.Close(), t)
+
+	dayOne := fakeTime()
+	setFakeTime(time.Date(2026, 6, 10, 10, 0, 0, 0, time.UTC))
+
+	b2 := []byte("day two")
+	n, err = l.Write(b2)
+	isNil(err, t)
+	equals(len(b2), n, t)
+
+	existsWithContent(dailyLogFileAt(dir, dayOne), b, t)
+	existsWithContent(dailyLogFileAt(dir, fakeTime()), b2, t)
+	equals(dailyLogFileAt(dir, fakeTime()), l.CurrentFilename(), t)
+	fileCount(dir, 2, t)
+}
+
+// TestDailyFilenameCloseReopenSameDay 验证同一天内 Close 后重新 Write
+// 追加写入当天文件，不轮转也不新建文件。
+func TestDailyFilenameCloseReopenSameDay(t *testing.T) {
+	setFakeTime(time.Date(2026, 6, 9, 10, 0, 0, 0, time.UTC))
+
+	dir := makeTempDir("TestDailyFilenameCloseReopenSameDay", t)
+	defer removeAll(dir)
+
+	l := &Logger{
+		Filename:      logFile(dir),
+		MaxSize:       100,
+		DailyFilename: true,
+	}
+	defer closeLogger(l)
+
+	b := []byte("first")
+	n, err := l.Write(b)
+	isNil(err, t)
+	equals(len(b), n, t)
+	isNil(l.Close(), t)
+
+	b2 := []byte("second")
+	n, err = l.Write(b2)
+	isNil(err, t)
+	equals(len(b2), n, t)
+
+	existsWithContent(dailyLogFileAt(dir, fakeTime()), append(append([]byte{}, b...), b2...), t)
+	fileCount(dir, 1, t)
+}
+
 func TestDailyFilenameAndSizeRotationBothApply(t *testing.T) {
 	megabyte = 1
 	setFakeTime(time.Date(2026, 6, 8, 10, 0, 0, 0, time.UTC))

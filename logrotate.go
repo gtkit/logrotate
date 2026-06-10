@@ -128,6 +128,8 @@ type Logger struct {
 
 	// OnError 接收后台清理、压缩或 panic recover 产生的错误。
 	// 为空时后台错误保持非致命并被忽略。Cleanup 返回的同步错误不会重复调用 OnError。
+	// 回调在后台清理 goroutine 中执行，回调内不要调用本 Logger 的 Close：
+	// Close 会等待该后台任务完成，而任务要等回调返回才算完成，互相等待造成死锁。
 	OnError func(error) `json:"-" yaml:"-"`
 
 	size           int64
@@ -314,7 +316,9 @@ func (l *Logger) openNew() error {
 		return fmt.Errorf("can't make directories for new logfile: %w", err)
 	}
 
-	if l.DailyFilename && l.currentActiveFilename() == "" {
+	// 无条件按当前日期重算：同一天内结果不变；Close 后跨天重开时
+	// 沿用缓存的旧日期文件名会导致新日志写入旧日期文件。
+	if l.DailyFilename {
 		l.setCurrentFilename(l.dailyFilename(l.now()))
 	}
 	name := l.filename()
@@ -366,7 +370,8 @@ func (l *Logger) openExistingOrNew(writeLen int, scheduleCleanup bool) error {
 		l.mill()
 	}
 
-	if l.DailyFilename && l.currentActiveFilename() == "" {
+	// 无条件按当前日期重算，原因同 openNew：避免重开时沿用旧日期文件名。
+	if l.DailyFilename {
 		l.setCurrentFilename(l.dailyFilename(l.now()))
 	}
 	filename := l.filename()
@@ -695,7 +700,7 @@ func (l *Logger) switchDailyFilename(writeLen int) error {
 	if err := l.close(); err != nil {
 		return err
 	}
-	l.setCurrentFilename(l.dailyFilename(l.now()))
+	// openExistingOrNew 会按当前日期重算活跃文件名。
 	return l.openExistingOrNew(writeLen, true)
 }
 
