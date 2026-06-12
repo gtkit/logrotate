@@ -5,7 +5,12 @@
 ## [Unreleased]
 
 ### Added
+- 新增 `New` 构造函数和 Functional Options 配置 API，方便在保留结构体字面量兼容性的同时创建 `Logger`。
+- 新增写入、轮转、清理、压缩和并行写入路径的 Benchmark 覆盖。
+
 ### Changed
+- 完善 README 中 `Close()` 与全局后台清理 worker 相关的并发说明。
+
 ### Deprecated
 ### Removed
 ### Fixed

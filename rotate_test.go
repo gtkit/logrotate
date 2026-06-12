@@ -19,7 +19,9 @@ func ExampleLogger_Rotate() {
 	go func() {
 		for {
 			<-c
-			l.Rotate()
+			if err := l.Rotate(); err != nil {
+				log.Printf("rotate log: %v", err)
+			}
 		}
 	}()
 }

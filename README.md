@@ -35,13 +35,13 @@ import (
 )
 
 func main() {
-	w := &logrotate.Logger{
-		Filename:   "/var/log/myapp/app.log",
-		MaxSize:    500, // MB
-		MaxBackups: 7,
-		MaxAge:     30, // 天
-		Compress:   true,
-	}
+	w := logrotate.New(
+		logrotate.WithFilename("/var/log/myapp/app.log"),
+		logrotate.WithMaxSize(500), // MB
+		logrotate.WithMaxBackups(7),
+		logrotate.WithMaxAge(30), // 天
+		logrotate.WithCompress(true),
+	)
 	defer w.Close()
 
 	log.SetOutput(w)
@@ -148,6 +148,23 @@ func main() {
 
 ## 常用配置
 
+可以使用 `New` 和 Functional Options 创建：
+
+```go
+w := logrotate.New(
+	logrotate.WithFilename("/var/log/myapp/app.log"),
+	logrotate.WithMaxSize(500),
+	logrotate.WithMaxBackups(7),
+	logrotate.WithMaxAge(30),
+	logrotate.WithLocation(time.Local),
+	logrotate.WithCompress(true),
+	logrotate.WithDaily(true),
+	logrotate.WithDailyFilename(false),
+)
+```
+
+也可以继续使用结构体字面量配置，已有代码不需要迁移：
+
 ```go
 w := &logrotate.Logger{
 	Filename:      "/var/log/myapp/app.log",
@@ -175,7 +192,7 @@ w := &logrotate.Logger{
 | `Now` | `nil` | 当前时间源；为空时使用 `time.Now`，主要用于测试 |
 | `OnError` | `nil` | 后台清理或压缩失败时的错误回调 |
 
-配置字段应在首次 `Write`、`Rotate` 或 `Close` 前设置好。开始使用后不要并发修改这些字段。
+配置字段或 Options 应在首次 `Write`、`Rotate` 或 `Close` 前设置好。开始使用后不要并发修改这些字段。
 
 ## 切割模式
 
@@ -368,7 +385,7 @@ func NewFileWriter(path string) *logrotate.Logger {
 - `Write()`、`Rotate()`、`Close()` 之间需串行调用：`Close()` 或 `Rotate()` 期间不要并发调用 `Write()`，`Close()` 期间也不要并发调用 `Rotate()`。
 - `Logger` 内部持有锁，首次使用后不得复制；请始终通过指针（`*logrotate.Logger`）传递和使用。
 - 配置字段必须在首次使用前设置完成，运行中不要并发修改。
-- 旧日志的压缩和清理在后台异步执行，不阻塞 `Write`。`Close()` 只等待本实例已调度的后台任务完成后才返回，不等待其他 `Logger` 实例的后台任务。
+- 旧日志的压缩和清理在后台异步执行，不阻塞 `Write`。`Close()` 会等待本实例已调度的后台任务完成后才返回；后台清理使用全局单 worker，如果 worker 正在处理其他 `Logger` 实例的大文件压缩，本实例的 `Close()` 也可能被排队间接延迟。
 - `Open()` 会初始化当前文件并同步执行清理；如果清理历史积压文件失败，错误会直接返回。
 - `Close()` 不会使 `Logger` 进入终止状态；之后再次 `Write` 会按现有配置重新打开日志文件。
 - 同一份日志文件只能由一个进程写入。多个进程使用相同 `Filename` 会导致不正确的轮转行为。
@@ -377,6 +394,7 @@ func NewFileWriter(path string) *logrotate.Logger {
 
 | 方法 | 说明 |
 |------|------|
+| `New(opts ...Option) *Logger` | 使用 Functional Options 创建 `Logger`；不传选项时等同于默认 `Logger` 行为 |
 | `Open() error` | 打开或创建当前活跃文件，并同步执行一次旧日志清理/压缩 |
 | `Write(p []byte) (int, error)` | 写入日志内容，必要时自动轮转 |
 | `Rotate() error` | 立即手动轮转当前日志文件 |
